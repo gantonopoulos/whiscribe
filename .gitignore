@@ -1,0 +1,19 @@
+# model weights
+llm_models/*.bin
+
+# recordings and transcripts
+*.wav
+whiscribe_*.txt
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# claude code
+.claude/
+
+# editor
+.idea/
+.vscode/
+*.swp
