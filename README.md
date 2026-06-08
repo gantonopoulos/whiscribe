@@ -1,6 +1,6 @@
 # whiscribe
 
-Voice dictation for Linux. Records audio from any input device, transcribes it with [whisper.cpp](https://github.com/ggerganov/whisper.cpp), and copies the result to the clipboard.
+Voice dictation for Linux. Records audio from any input device, transcribes it with [whisper.cpp](https://github.com/ggerganov/whisper.cpp), and copies the transcript text to the clipboard. Optionally saves to a file.
 
 Targets KDE Plasma / Wayland on Manjaro Linux, but should work on any PipeWire/PulseAudio system with Wayland.
 
@@ -81,32 +81,30 @@ Press **Ctrl+C** to stop recording. Transcription starts automatically.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-m, --model FILE` | `llm_models/ggml-small.bin` | whisper model to use |
-| `-o, --output-dir DIR` | current directory | where to save output files |
-| `-n, --filename NAME` | `whiscribe_YYYYMMDD_HHMMSS` | base name for `.wav` and `.txt` files |
+| `-o, --output FILE` | — | save transcript to this file (default: clipboard only) |
 | `-t, --threads N` | `4` | inference thread count |
-| `--gpu` | off | enable GPU inference via Vulkan |
 | `-l, --language LANG` | auto-detect | language hint, e.g. `en`, `el` |
-| `--plain-text` | off | strip timestamps from saved text |
-| `--clip` | `path` | clipboard content: `path` = `.txt` file path, `content` = transcript text |
+| `--timestamps` | off | include whisper timestamps in output |
+| `--clip` | off | also copy to clipboard when `-o` is given |
+
+GPU inference via Vulkan is tried automatically first; falls back to CPU if unavailable.
 
 ### Examples
 
 ```bash
-# Default — small model, CPU, copies file path to clipboard
+# Default — transcript text copied to clipboard, nothing saved to disk
 whiscribe.py
 
-# Large model with GPU, copy transcript text to clipboard
-whiscribe.py -m llm_models/ggml-large-v3.bin --gpu --clip content
+# Save transcript to a file (clipboard not used)
+whiscribe.py -o ~/notes/meeting.txt
 
-# Save to a specific directory with a fixed filename
-whiscribe.py -o ~/notes -n meeting
+# Save to file AND copy to clipboard
+whiscribe.py -o ~/notes/meeting.txt --clip
+
+# Keep whisper timestamps in the output (useful for LLM context or video work)
+whiscribe.py -o ~/notes/meeting.txt --timestamps
 ```
 
 ## Output
 
-Each recording produces two files:
-
-- `whiscribe_YYYYMMDD_HHMMSS.wav` — raw audio
-- `whiscribe_YYYYMMDD_HHMMSS.txt` — transcript (with timestamps by default)
-
-By default the path to the `.txt` file is copied to the clipboard so it can be pasted directly as a file reference.
+By default nothing is saved to disk — the transcript text is copied directly to the clipboard. Use `-o FILE` to save to a specific path. The raw WAV recording is always discarded after transcription.

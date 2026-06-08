@@ -3,13 +3,13 @@
 
 import argparse
 import curses
-import datetime
 import os
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import NamedTuple
 
@@ -267,8 +267,8 @@ def transcribe(
     threads: int,
     no_gpu: bool,
     language: str | None,
-) -> str:
-    """Run whisper-cli, stream each transcript segment to the terminal, return full text."""
+) -> str | None:
+    """Run whisper-cli, stream each transcript segment to the terminal, return full text or None on failure."""
     cmd = [
         "whisper-cli",
         "-m", str(model_path),
@@ -298,9 +298,28 @@ def transcribe(
             lines.append(line)
     proc.wait()
     if proc.returncode != 0:
-        sys.exit(f"whisper-cli exited with code {proc.returncode}")
+        return None
 
     return "\n".join(lines)
+
+
+def transcribe_with_gpu_fallback(
+    wav_path: pathlib.Path,
+    model_path: pathlib.Path,
+    threads: int,
+    language: str | None,
+) -> str:
+    """Try GPU transcription first; fall back to CPU if it fails."""
+    print("\nTranscribing (GPU)...")
+    result = transcribe(wav_path, model_path, threads, no_gpu=False, language=language)
+    if result is not None:
+        return result
+
+    print("GPU transcription failed, retrying on CPU...")
+    result = transcribe(wav_path, model_path, threads, no_gpu=True, language=language)
+    if result is None:
+        sys.exit("Transcription failed on both GPU and CPU.")
+    return result
 
 
 def strip_timestamps(text: str) -> str:
@@ -310,12 +329,6 @@ def strip_timestamps(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-
-def build_stem(output_dir: pathlib.Path, filename: str | None) -> pathlib.Path:
-    if filename:
-        return output_dir / filename
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return output_dir / f"whiscribe_{stamp}"
 
 
 def main() -> None:
@@ -329,37 +342,26 @@ def main() -> None:
         help="Path to whisper .bin model file",
     )
     parser.add_argument(
-        "-o", "--output-dir", type=pathlib.Path, default=pathlib.Path.cwd(),
-        metavar="DIR",
-        help="Directory where WAV and TXT files are saved",
-    )
-    parser.add_argument(
-        "-n", "--filename",
-        metavar="NAME",
-        help="Base filename for outputs (no extension); default: whiscribe_YYYYMMDD_HHMMSS",
+        "-o", "--output", type=pathlib.Path,
+        metavar="FILE",
+        help="Save transcript to this file path (default: clipboard only, no file saved)",
     )
     parser.add_argument(
         "-t", "--threads", type=int, default=4,
         help="Number of threads for whisper inference",
     )
     parser.add_argument(
-        "--gpu", dest="no_gpu", action="store_false",
-        help="Enable GPU inference (default: CPU only)",
-    )
-    parser.set_defaults(no_gpu=True)
-    parser.add_argument(
         "-l", "--language",
         metavar="LANG",
         help="Language code hint for whisper (e.g. 'en', 'el'); auto-detect if omitted",
     )
     parser.add_argument(
-        "--plain-text", action="store_true",
-        help="Strip timestamps from the saved text file (default: keep them)",
+        "--timestamps", action="store_true",
+        help="Include whisper timestamps in output (default: plain text)",
     )
     parser.add_argument(
-        "--clip", choices=["path", "content"], default="path",
-        help="What to copy to clipboard: 'path' = relative path to .txt file (default), "
-             "'content' = full transcript text",
+        "--clip", action="store_true",
+        help="Also copy transcript to clipboard when -o is given (default with -o: file only)",
     )
 
     args = parser.parse_args()
@@ -367,7 +369,12 @@ def main() -> None:
     if not args.model.exists():
         sys.exit(f"Model not found: {args.model}")
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # --- check output file before doing anything ---
+    if args.output and args.output.exists():
+        answer = input(f"File already exists: {args.output}\nOverwrite? [y/N] ").strip().lower()
+        if answer != "y":
+            print("Aborted.")
+            sys.exit(0)
 
     # --- device selection ---
     devices = list_input_devices()
@@ -382,10 +389,10 @@ def main() -> None:
     # --- prepare device (switches BT profile if needed) ---
     source_name, bt_card, bt_saved_profile = prepare_device(device)
 
-    # --- file paths ---
-    stem = build_stem(args.output_dir, args.filename)
-    wav_path = stem.with_suffix(".wav")
-    txt_path = stem.with_suffix(".txt")
+    # --- WAV goes to a temp file, always deleted after transcription ---
+    tmp_fd, tmp_wav = tempfile.mkstemp(suffix=".wav", prefix="whiscribe_")
+    os.close(tmp_fd)
+    wav_path = pathlib.Path(tmp_wav)
 
     # --- record; always restore BT profile in finally ---
     try:
@@ -395,33 +402,36 @@ def main() -> None:
             print("Restoring Bluetooth profile...")
             switch_bt_profile(bt_card, bt_saved_profile)
 
-    if not wav_path.exists() or wav_path.stat().st_size < 1024:
-        sys.exit("No usable recording — WAV file is missing or too small.")
+    try:
+        if not wav_path.exists() or wav_path.stat().st_size < 1024:
+            sys.exit("No usable recording — WAV file is missing or too small.")
 
-    # --- transcribe ---
-    print("\nTranscribing...")
-    raw_text = transcribe(wav_path, args.model, args.threads, args.no_gpu, args.language)
-    print()
+        # --- transcribe (GPU first, CPU fallback) ---
+        raw_text = transcribe_with_gpu_fallback(wav_path, args.model, args.threads, args.language)
+        print()
+    finally:
+        wav_path.unlink(missing_ok=True)
 
     if not raw_text:
         print("Warning: whisper returned empty output.")
 
-    saved_text = strip_timestamps(raw_text) if args.plain_text else raw_text
+    final_text = raw_text if args.timestamps else strip_timestamps(raw_text)
 
-    txt_path.write_text(saved_text + "\n", encoding="utf-8")
-    print(f"Text : {txt_path}")
-    print(f"Audio: {wav_path}")
+    # --- save to file if -o given ---
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(final_text + "\n", encoding="utf-8")
+        print(f"Saved: {args.output}")
 
-    if shutil.which("wl-copy"):
-        if args.clip == "path":
-            try:
-                clip_value = str(txt_path.relative_to(pathlib.Path.cwd()))
-            except ValueError:
-                clip_value = str(txt_path)
+    # --- clipboard: always in default mode; only with --clip when -o is given ---
+    copy_to_clipboard = (args.output is None) or args.clip
+    if copy_to_clipboard:
+        if shutil.which("wl-copy"):
+            subprocess.run(["wl-copy"], input=final_text, text=True, check=False)
+            subprocess.run(["wl-copy", "--primary"], input=final_text, text=True, check=False)
+            print("Copied to clipboard and primary selection.")
         else:
-            clip_value = saved_text
-        subprocess.run(["wl-copy"], input=clip_value, text=True, check=False)
-        print(f"Copied to clipboard: {'file path' if args.clip == 'path' else 'transcript text'}")
+            print("wl-copy not found — clipboard not updated.")
 
 
 if __name__ == "__main__":
