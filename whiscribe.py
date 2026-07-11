@@ -17,6 +17,20 @@ from typing import NamedTuple
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
 DEFAULT_MODEL = SCRIPT_DIR / "llm_models" / "ggml-small.bin"
 
+# Voice Activity Detection model. Auto-enabled when present; download from
+# https://huggingface.co/ggml-org/whisper-vad and place in llm_models/.
+DEFAULT_VAD_MODEL = SCRIPT_DIR / "llm_models" / "ggml-silero-v5.1.2.bin"
+
+# Quality tuning passed to whisper-cli. Tighter than whisper.cpp defaults
+# (no-speech 0.60, logprob -1.00) to reject low-confidence / silent segments
+# that Whisper otherwise hallucinates text into.
+NO_SPEECH_THRESHOLD = "0.45"
+LOGPROB_THRESHOLD = "-0.7"
+
+# Native Whisper input format — recording here avoids a downsample step.
+RECORD_RATE = "16000"
+RECORD_CHANNELS = "1"
+
 
 class InputDevice(NamedTuple):
     label: str
@@ -246,7 +260,9 @@ def record(source_name: str, output_path: pathlib.Path) -> None:
     print("\nRecording... Press Ctrl+C to stop.\n")
     env = {**os.environ, "PULSE_SOURCE": source_name}
     proc = subprocess.Popen(
-        ["arecord", "-D", "pulse", "-f", "cd", "-t", "wav", str(output_path)],
+        ["arecord", "-D", "pulse",
+         "-f", "S16_LE", "-r", RECORD_RATE, "-c", RECORD_CHANNELS,
+         "-t", "wav", str(output_path)],
         env=env,
         stderr=subprocess.DEVNULL,
     )
@@ -267,6 +283,7 @@ def transcribe(
     threads: int,
     no_gpu: bool,
     language: str | None,
+    vad_model: pathlib.Path | None = None,
 ) -> str | None:
     """Run whisper-cli, stream each transcript segment to the terminal, return full text or None on failure."""
     cmd = [
@@ -274,7 +291,13 @@ def transcribe(
         "-m", str(model_path),
         "-f", str(wav_path),
         "-t", str(threads),
+        "--no-speech-thold", NO_SPEECH_THRESHOLD,
+        "--logprob-thold", LOGPROB_THRESHOLD,
     ]
+    # VAD strips non-speech regions before inference — the biggest single
+    # reducer of hallucinated text on silence. Only usable if the model is present.
+    if vad_model and vad_model.exists():
+        cmd += ["--vad", "--vad-model", str(vad_model)]
     if no_gpu:
         cmd.append("--no-gpu")
     if language:
@@ -308,15 +331,16 @@ def transcribe_with_gpu_fallback(
     model_path: pathlib.Path,
     threads: int,
     language: str | None,
+    vad_model: pathlib.Path | None = None,
 ) -> str:
     """Try GPU transcription first; fall back to CPU if it fails."""
     print("\nTranscribing (GPU)...")
-    result = transcribe(wav_path, model_path, threads, no_gpu=False, language=language)
+    result = transcribe(wav_path, model_path, threads, no_gpu=False, language=language, vad_model=vad_model)
     if result is not None:
         return result
 
     print("GPU transcription failed, retrying on CPU...")
-    result = transcribe(wav_path, model_path, threads, no_gpu=True, language=language)
+    result = transcribe(wav_path, model_path, threads, no_gpu=True, language=language, vad_model=vad_model)
     if result is None:
         sys.exit("Transcription failed on both GPU and CPU.")
     return result
@@ -324,6 +348,15 @@ def transcribe_with_gpu_fallback(
 
 def strip_timestamps(text: str) -> str:
     return re.sub(r"\[[\d:.]+ --> [\d:.]+\]\s*", "", text).strip()
+
+
+def collapse_trailing_repeats(text: str) -> str:
+    """Drop consecutive identical trailing lines — a common Whisper hallucination
+    loop (e.g. repeated 'Thank you.') on trailing near-silence."""
+    lines = text.split("\n")
+    while len(lines) >= 2 and lines[-1].strip() and lines[-1].strip() == lines[-2].strip():
+        lines.pop()
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -363,11 +396,24 @@ def main() -> None:
         "--clip", action="store_true",
         help="Also copy transcript to clipboard when -o is given (default with -o: file only)",
     )
+    parser.add_argument(
+        "--vad-model", type=pathlib.Path, default=DEFAULT_VAD_MODEL,
+        metavar="FILE",
+        help="Silero VAD model; enables speech-region filtering when the file exists",
+    )
+    parser.add_argument(
+        "--no-vad", action="store_true",
+        help="Disable Voice Activity Detection even if a VAD model is present",
+    )
 
     args = parser.parse_args()
 
     if not args.model.exists():
         sys.exit(f"Model not found: {args.model}")
+
+    vad_model = None if args.no_vad else args.vad_model
+    if vad_model and not vad_model.exists():
+        print(f"Note: VAD model not found at {vad_model} — transcribing without VAD.")
 
     # --- check output file before doing anything ---
     if args.output and args.output.exists():
@@ -407,7 +453,8 @@ def main() -> None:
             sys.exit("No usable recording — WAV file is missing or too small.")
 
         # --- transcribe (GPU first, CPU fallback) ---
-        raw_text = transcribe_with_gpu_fallback(wav_path, args.model, args.threads, args.language)
+        raw_text = transcribe_with_gpu_fallback(
+            wav_path, args.model, args.threads, args.language, vad_model=vad_model)
         print()
     finally:
         wav_path.unlink(missing_ok=True)
@@ -416,6 +463,7 @@ def main() -> None:
         print("Warning: whisper returned empty output.")
 
     final_text = raw_text if args.timestamps else strip_timestamps(raw_text)
+    final_text = collapse_trailing_repeats(final_text)
 
     # --- save to file if -o given ---
     if args.output:

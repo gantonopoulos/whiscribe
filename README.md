@@ -53,6 +53,17 @@ curl -L "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bi
      -o llm_models/ggml-small.bin
 ```
 
+### Voice Activity Detection (optional, recommended)
+
+A Silero VAD model lets whiscribe strip non-speech regions before transcription,
+which sharply reduces hallucinated text on silence. It is enabled automatically
+when the model file is present in `llm_models/`; disable per-run with `--no-vad`.
+
+```bash
+curl -L "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin" \
+     -o llm_models/ggml-silero-v5.1.2.bin
+```
+
 ## Installation
 
 Make the script executable and optionally put it on your PATH:
@@ -86,8 +97,14 @@ Press **Ctrl+C** to stop recording. Transcription starts automatically.
 | `-l, --language LANG` | auto-detect | language hint, e.g. `en`, `el` |
 | `--timestamps` | off | include whisper timestamps in output |
 | `--clip` | off | also copy to clipboard when `-o` is given |
+| `--vad-model FILE` | `llm_models/ggml-silero-v5.1.2.bin` | Silero VAD model; used automatically when the file exists |
+| `--no-vad` | off | disable VAD even if a VAD model is present |
 
 GPU inference via Vulkan is tried automatically first; falls back to CPU if unavailable.
+
+Recording is captured at 16 kHz mono (Whisper's native format), and transcription
+uses tightened no-speech/log-probability thresholds plus trailing-repeat cleanup to
+reduce hallucinated output.
 
 ### Examples
 
