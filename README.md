@@ -1,6 +1,6 @@
 # whiscribe
 
-Voice dictation for Linux. Records audio from any input device, transcribes it with [whisper.cpp](https://github.com/ggerganov/whisper.cpp), and copies the transcript text to the clipboard. Optionally saves to a file.
+Voice dictation for Linux. Records audio from any input device, transcribes it with [whisper.cpp](https://github.com/ggerganov/whisper.cpp), and copies the transcript text to the clipboard. Optionally saves to a file. Usable as a command-line tool (`whiscribe.py`) or a system tray app with a global shortcut (`tray.py`).
 
 Targets KDE Plasma / Wayland on Manjaro Linux, but should work on any PipeWire/PulseAudio system with Wayland.
 
@@ -18,8 +18,9 @@ Targets KDE Plasma / Wayland on Manjaro Linux, but should work on any PipeWire/P
 
 ### Python
 
-Python 3.11 or newer (the config reader uses the stdlib `tomllib` module). No pip
-dependencies — only standard library modules are used.
+Python 3.11 or newer (the config reader uses the stdlib `tomllib` module). The CLI
+uses only standard-library modules. The optional tray app additionally needs
+**PySide6** (`pip install pyside6`, or `pacman -S pyside6`).
 
 ### GPU acceleration (optional)
 
@@ -147,3 +148,40 @@ whiscribe.py -o ~/notes/meeting.txt --timestamps
 ## Output
 
 By default nothing is saved to disk — the transcript text is copied directly to the clipboard. Use `-o FILE` to save to a specific path. The raw WAV recording is always discarded after transcription.
+
+## System tray app
+
+`tray.py` is a PySide6 tray front end sharing the same backend (device handling,
+VAD, hallucination defenses, config). It reads the same `config.toml`; pick the
+microphone from its menu (remembered across restarts) and edit settings via
+**Edit config…**.
+
+### Install
+
+```bash
+chmod +x tray.py
+ln -s "$(pwd)/tray.py" ~/.local/bin/whiscribe-tray
+
+# Autostart on login (KDE reads ~/.config/autostart)
+cp whiscribe-tray.desktop ~/.config/autostart/
+```
+
+### Usage
+
+Launch `whiscribe-tray` (or log in with autostart enabled). Left-click the tray icon
+or use the menu:
+
+- **Record to clipboard** / **Record to file…** — start recording; **Stop recording** ends it.
+- Left-clicking the icon toggles recording to the clipboard.
+
+### Global shortcut (KDE Wayland)
+
+The tray app can't grab a global hotkey directly on Wayland; instead bind a key to a
+command that toggles the running instance:
+
+1. **System Settings → Shortcuts → Add → Command or Script**
+2. Set the command to `whiscribe-tray --toggle`
+3. Assign a key (e.g. `Meta+R`).
+
+`whiscribe-tray --toggle` messages the running instance over a local socket to
+start/stop recording. Only one instance runs at a time.
