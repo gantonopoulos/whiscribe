@@ -11,14 +11,15 @@ import os
 import pathlib
 import sys
 import tempfile
+import threading
 
 # Ensure sibling modules import even when invoked through a symlink.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPoint
+from PySide6.QtCore import QThread, Signal, QTimer
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import (
-    QApplication, QSystemTrayIcon, QMenu, QFileDialog, QWidget, QLabel, QHBoxLayout,
+    QApplication, QSystemTrayIcon, QMenu, QFileDialog, QWidget,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -58,8 +59,12 @@ class RecordWorker(QThread):
         super().__init__()
         self.device = device
         self._recorder: backend.Recorder | None = None
+        self._stop_requested = False
 
     def stop(self) -> None:
+        # Flag first: stop() may arrive before run() has created the recorder
+        # (a fast toggle→cancel), so run() re-checks the flag after starting.
+        self._stop_requested = True
         if self._recorder:
             self._recorder.stop()
 
@@ -77,7 +82,10 @@ class RecordWorker(QThread):
         try:
             self._recorder = backend.Recorder(source_name, wav_path)
             self._recorder.start()
-            self._recorder.wait()
+            if self._stop_requested:
+                self._recorder.stop()
+            else:
+                self._recorder.wait()
         except Exception as exc:  # noqa: BLE001
             wav_path.unlink(missing_ok=True)
             self.failed.emit(str(exc))
@@ -111,6 +119,10 @@ class TranscribeWorker(QThread):
         self.cfg = cfg
         self.model_path = model_path
         self.vad_model = vad_model
+        self._cancel = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
 
     def run(self) -> None:
         wav = pathlib.Path(self.wav_path)
@@ -118,7 +130,10 @@ class TranscribeWorker(QThread):
             raw = backend.transcribe_with_gpu_fallback(
                 wav, self.model_path, self.cfg["threads"],
                 self.cfg["language"] or None, vad_model=self.vad_model,
+                cancel_event=self._cancel,
             )
+        except backend.Cancelled:
+            return  # aborted by the user; the tray resets its own UI
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
             return
@@ -134,80 +149,50 @@ class TranscribeWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Status overlay
+# User feedback
 # ---------------------------------------------------------------------------
 
-class StatusWidget(QWidget):
-    """Small borderless overlay near the tray showing state + elapsed time."""
+class TrayFeedback:
+    """User feedback via native desktop notifications, which the compositor
+    positions (Wayland forbids client-positioned overlays), plus a live
+    elapsed-time tooltip on the tray icon while recording."""
 
-    def __init__(self):
-        super().__init__()
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
-        self.setStyleSheet(
-            "background-color: #1e1e2e; color: #cdd6f4; border-radius: 6px;"
-        )
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 7, 12, 7)
-
-        self.indicator = QLabel("⬤")  # ⬤
-        layout.addWidget(self.indicator)
-        self.label = QLabel("Recording...")
-        layout.addWidget(self.label)
-        self.timer_label = QLabel("0:00")
-        layout.addWidget(self.timer_label)
-
+    def __init__(self, tray: QSystemTrayIcon):
+        self.tray = tray
         self._elapsed = 0
-        self._timer = QTimer(self)
+        self._timer = QTimer()
         self._timer.timeout.connect(self._tick)
+
+    def _notify(self, message: str, msecs: int = 3000):
+        self.tray.showMessage("whiscribe", message, self.tray.icon(), msecs)
 
     def show_recording(self):
         self._elapsed = 0
-        self.indicator.setStyleSheet("color: #f38ba8;")
-        self.label.setText("Recording...")
-        self.timer_label.setText("0:00")
-        self.timer_label.show()
+        self.tray.setToolTip("whiscribe — Recording 0:00")
         self._timer.start(1000)
-        self._show()
+        self._notify("Recording…")
 
     def show_transcribing(self):
         self._timer.stop()
-        self.indicator.setStyleSheet("color: #f9e2af;")
-        self.label.setText("Transcribing...")
-        self.timer_label.hide()
-        self._show()
+        self.tray.setToolTip("whiscribe — Transcribing…")
 
     def show_done(self, message: str):
         self._timer.stop()
-        self.indicator.setStyleSheet("color: #a6e3a1;")
-        self.label.setText(message)
-        self.timer_label.hide()
-        self._show()
-        QTimer.singleShot(2500, self.hide)
+        self.tray.setToolTip("whiscribe — ready")
+        self._notify(message)
 
     def show_error(self, message: str):
         self._timer.stop()
-        self.indicator.setStyleSheet("color: #f38ba8;")
-        self.label.setText(message)
-        self.timer_label.hide()
-        self._show()
-        QTimer.singleShot(5000, self.hide)
+        self.tray.setToolTip("whiscribe — ready")
+        self._notify(message, 5000)
+
+    def stop(self):
+        self._timer.stop()
 
     def _tick(self):
         self._elapsed += 1
-        self.timer_label.setText(f"{self._elapsed // 60}:{self._elapsed % 60:02d}")
-
-    def _show(self):
-        self.adjustSize()
-        screen = QApplication.primaryScreen()
-        if screen:
-            geom = screen.availableGeometry()
-            self.move(QPoint(geom.right() - self.width() - 12,
-                             geom.bottom() - self.height() - 12))
-        self.show()
+        self.tray.setToolTip(
+            f"whiscribe — Recording {self._elapsed // 60}:{self._elapsed % 60:02d}")
 
 
 # ---------------------------------------------------------------------------
@@ -225,14 +210,14 @@ class WhisperTray(QWidget):
 
         self._recording = False
         self._transcribing = False
+        self._cancelled = False
         self._record_worker: RecordWorker | None = None
         self._transcribe_worker: TranscribeWorker | None = None
         self._output_file: str | None = None
         self._devices: list[backend.InputDevice] = []
         self._selected_device: backend.InputDevice | None = None
 
-        self.status = StatusWidget()
-        self._setup_tray()
+        self._setup_tray()   # creates self.tray and self.status
         self._setup_ipc()
 
     # --- persistent tray state (device selection) -------------------------
@@ -257,6 +242,7 @@ class WhisperTray(QWidget):
         self.tray.setIcon(_icon("idle"))
         self.tray.setToolTip("whiscribe — ready")
         self.tray.activated.connect(self._on_activated)
+        self.status = TrayFeedback(self.tray)
 
         self.menu = QMenu()
 
@@ -274,6 +260,11 @@ class WhisperTray(QWidget):
         self.act_stop.setEnabled(False)
         self.act_stop.triggered.connect(self._stop)
         self.menu.addAction(self.act_stop)
+
+        self.act_cancel = QAction("Cancel", self)
+        self.act_cancel.setEnabled(False)
+        self.act_cancel.triggered.connect(self.cancel)
+        self.menu.addAction(self.act_cancel)
 
         self.menu.addSeparator()
 
@@ -359,6 +350,17 @@ class WhisperTray(QWidget):
         elif not self._transcribing:
             self._start(to_file=False)
 
+    def cancel(self):
+        """Abort and discard: mid-recording throws away the audio; mid-transcription
+        kills whisper and produces nothing."""
+        if self._recording and self._record_worker:
+            self._cancelled = True          # honored in _on_recorded / _on_error
+            self._record_worker.stop()
+        elif self._transcribing and self._transcribe_worker:
+            self._transcribe_worker.request_cancel()
+            self._reset_idle()
+            self.status.show_error("Cancelled")
+
     # --- recording --------------------------------------------------------
 
     def _start(self, to_file: bool):
@@ -399,6 +401,13 @@ class WhisperTray(QWidget):
             self._record_worker.stop()
 
     def _on_recorded(self, wav_path: str):
+        if self._cancelled:
+            self._cancelled = False
+            pathlib.Path(wav_path).unlink(missing_ok=True)
+            self._reset_idle()
+            self.status.show_error("Cancelled")
+            return
+
         self._recording = False
         self._transcribing = True
         self._set_busy_ui("busy")
@@ -429,6 +438,13 @@ class WhisperTray(QWidget):
                 self.status.show_error("Clipboard unavailable")
 
     def _on_error(self, message: str):
+        # A cancel during recording can surface as a too-short-capture error;
+        # report it as a cancellation, not a failure.
+        if self._cancelled:
+            self._cancelled = False
+            self._reset_idle()
+            self.status.show_error("Cancelled")
+            return
         self._reset_idle()
         self.status.show_error(message)
 
@@ -438,6 +454,7 @@ class WhisperTray(QWidget):
         self.tray.setIcon(_icon(state))
         self.tray.setToolTip(f"whiscribe — {state}")
         self.act_stop.setEnabled(state == "recording")
+        self.act_cancel.setEnabled(True)
         self.act_clip.setEnabled(False)
         self.act_file.setEnabled(False)
 
@@ -447,6 +464,7 @@ class WhisperTray(QWidget):
         self.tray.setIcon(_icon("idle"))
         self.tray.setToolTip("whiscribe — ready")
         self.act_stop.setEnabled(False)
+        self.act_cancel.setEnabled(False)
         self.act_clip.setEnabled(True)
         self.act_file.setEnabled(True)
 
@@ -466,6 +484,8 @@ class WhisperTray(QWidget):
             cmd = bytes(conn.readAll().data()).decode(errors="ignore").strip()
             if cmd == "toggle":
                 self.toggle()
+            elif cmd == "cancel":
+                self.cancel()
         conn.disconnectFromServer()
 
     def _quit(self):
@@ -475,7 +495,7 @@ class WhisperTray(QWidget):
         if self._transcribe_worker and self._transcribe_worker.isRunning():
             self._transcribe_worker.wait(5000)
         self.server.close()
-        self.status.hide()
+        self.status.stop()
         self.tray.hide()
         self.app.quit()
 
@@ -484,15 +504,15 @@ class WhisperTray(QWidget):
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _forward_toggle(send: bool) -> bool:
-    """Connect to a running instance (if any). When connected and `send` is set,
-    tell it to toggle. Returns True if an instance was reached."""
+def _forward(command: str | None) -> bool:
+    """Connect to a running instance (if any). When connected and `command` is
+    given, send it. Returns True if an instance was reached."""
     sock = QLocalSocket()
     sock.connectToServer(SOCKET_NAME)
     if not sock.waitForConnected(300):
         return False
-    if send:
-        sock.write(b"toggle")
+    if command:
+        sock.write(command.encode())
         sock.waitForBytesWritten(400)
     sock.disconnectFromServer()
     return True
@@ -503,14 +523,15 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("whiscribe-tray")
 
-    toggle = "--toggle" in sys.argv[1:]
+    args = sys.argv[1:]
+    command = "toggle" if "--toggle" in args else "cancel" if "--cancel" in args else None
 
-    # Single-instance: a running instance handles --toggle and rejects a second launch.
-    if _forward_toggle(send=toggle):
-        if not toggle:
+    # Single-instance: a running instance handles the command and rejects a second launch.
+    if _forward(command):
+        if command is None:
             print("whiscribe-tray is already running.")
         return
-    if toggle:
+    if command:
         print("whiscribe-tray is not running.")
         return
 

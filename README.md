@@ -171,17 +171,17 @@ cp whiscribe-tray.desktop ~/.config/autostart/
 Launch `whiscribe-tray` (or log in with autostart enabled). Left-click the tray icon
 or use the menu:
 
-- **Record to clipboard** / **Record to file…** — start recording; **Stop recording** ends it.
+- **Record to clipboard** / **Record to file…** — start recording; **Stop recording** ends it and transcribes.
+- **Cancel** — abort and discard, whether recording (throws away the audio) or transcribing (kills whisper, produces nothing).
 - Left-clicking the icon toggles recording to the clipboard.
 
-### Global shortcut (KDE Wayland)
+### Global shortcuts (KDE Wayland)
 
-The tray app can't grab a global hotkey directly on Wayland; instead bind a key to a
-command that toggles the running instance:
+The tray app can't grab a global hotkey directly on Wayland; instead bind keys to
+commands that message the running instance over a local socket:
 
 1. **System Settings → Shortcuts → Add → Command or Script**
-2. Set the command to `whiscribe-tray --toggle`
-3. Assign a key (e.g. `Meta+R`).
+2. Add `whiscribe-tray --toggle` and assign a key (e.g. `Ctrl+Meta+R`) — start/stop.
+3. Add `whiscribe-tray --cancel` and assign another (e.g. `Ctrl+Meta+X`) — abort/discard.
 
-`whiscribe-tray --toggle` messages the running instance over a local socket to
-start/stop recording. Only one instance runs at a time.
+(`Meta` is the Super/Win key.) Only one instance runs at a time; a second launch exits.

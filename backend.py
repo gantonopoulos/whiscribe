@@ -9,9 +9,14 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 import tomllib
 from typing import NamedTuple
+
+
+class Cancelled(Exception):
+    """Raised by transcription when a caller-supplied cancel event fires."""
 
 
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
@@ -316,8 +321,10 @@ def transcribe(
     no_gpu: bool,
     language: str | None,
     vad_model: pathlib.Path | None = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> str | None:
-    """Run whisper-cli, stream each transcript segment to stdout, return full text or None on failure."""
+    """Run whisper-cli, stream each transcript segment to stdout, return full text
+    or None on failure. Raises Cancelled if cancel_event fires mid-run."""
     cmd = [
         "whisper-cli",
         "-m", str(model_path),
@@ -353,6 +360,19 @@ def transcribe(
         stderr=subprocess.DEVNULL,
         text=True,
     )
+
+    # A watcher terminates whisper-cli promptly on cancel — even during the
+    # (output-free) model-load phase, which a per-line check would miss.
+    watcher: threading.Thread | None = None
+    if cancel_event is not None:
+        def _watch():
+            while proc.poll() is None:
+                if cancel_event.wait(0.2):
+                    proc.terminate()
+                    return
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
+
     lines: list[str] = []
     for raw_line in proc.stdout:
         line = raw_line.rstrip("\n")
@@ -360,6 +380,11 @@ def transcribe(
             print(line)
             lines.append(line)
     proc.wait()
+    if watcher is not None:
+        watcher.join(timeout=1)
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise Cancelled()
     if proc.returncode != 0:
         return None
 
@@ -372,16 +397,19 @@ def transcribe_with_gpu_fallback(
     threads: int,
     language: str | None,
     vad_model: pathlib.Path | None = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> str:
     """Try GPU transcription first; fall back to CPU if it fails.
-    Raises RuntimeError if both fail."""
+    Raises RuntimeError if both fail, or Cancelled if aborted (no CPU retry)."""
     print("\nTranscribing (GPU)...")
-    result = transcribe(wav_path, model_path, threads, no_gpu=False, language=language, vad_model=vad_model)
+    result = transcribe(wav_path, model_path, threads, no_gpu=False,
+                        language=language, vad_model=vad_model, cancel_event=cancel_event)
     if result is not None:
         return result
 
     print("GPU transcription failed, retrying on CPU...")
-    result = transcribe(wav_path, model_path, threads, no_gpu=True, language=language, vad_model=vad_model)
+    result = transcribe(wav_path, model_path, threads, no_gpu=True,
+                        language=language, vad_model=vad_model, cancel_event=cancel_event)
     if result is None:
         raise RuntimeError("Transcription failed on both GPU and CPU.")
     return result
