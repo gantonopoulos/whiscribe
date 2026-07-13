@@ -1,0 +1,17 @@
+[Unit]
+Description=Whiscribe voice dictation tray
+# Start with the graphical session (the tray host must be up first).
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/whiscribe-tray
+# If the tray host isn't ready yet at login, retry until it is.
+Restart=on-failure
+RestartSec=3
+# stdout/stderr are captured by the journal: journalctl --user -u whiscribe-tray
+SyslogIdentifier=whiscribe-tray
+
+[Install]
+WantedBy=graphical-session.target

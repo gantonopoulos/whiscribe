@@ -21,6 +21,8 @@ A Python 3.11+ voice dictation tool for Linux that orchestrates external CLI bin
 
 There is no test suite or linter. Verifying changes needs a live machine with the runtime binaries + audio input, so most checks are: `python3 -c "import ast; ast.parse(open('backend.py').read())"` for syntax, `python3 -c "import backend; print(backend.list_input_devices())"` for the device path, and the user running the tool. The tray launches on the live Wayland session; a second launch exits with "already running" (single-instance guard).
 
+**Do not blindly send `whiscribe-tray --toggle` to test** — if an instance is running it starts a real recording on the user's mic (this has bitten before). The tray normally runs as a **systemd user service** (`install.sh` sets it up): after changing `tray.py`/`backend.py`, apply it with `systemctl --user restart whiscribe-tray`, and read logs via `journalctl --user -u whiscribe-tray`. Uncaught exceptions are logged through a `sys.excepthook` installed in `main()`.
+
 ## External binary dependencies (all invoked via subprocess)
 
 The program is essentially glue around these; behavior depends heavily on their exact output format:

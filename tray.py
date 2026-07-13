@@ -7,11 +7,13 @@ which talks to the running instance over a local socket (see README). Shared
 recording/transcription logic lives in backend.py."""
 
 import json
+import logging
 import os
 import pathlib
 import sys
 import tempfile
 import threading
+import traceback
 
 # Ensure sibling modules import even when invoked through a symlink.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -27,6 +29,7 @@ import backend
 
 SOCKET_NAME = "whiscribe-tray"
 STATE_PATH = backend.CONFIG_DIR / "tray_state.json"
+APP_ICON = backend.SCRIPT_DIR / "whiscribe.svg"
 
 # Theme icon candidates per state (first that exists in the icon theme wins).
 ICONS = {
@@ -37,6 +40,10 @@ ICONS = {
 
 
 def _icon(state: str) -> QIcon:
+    # Idle uses the app's own icon; active states use theme icons that read as
+    # distinct states (a red record dot, a busy spinner).
+    if state == "idle" and APP_ICON.exists():
+        return QIcon(str(APP_ICON))
     for name in ICONS[state]:
         ic = QIcon.fromTheme(name)
         if not ic.isNull():
@@ -518,7 +525,21 @@ def _forward(command: str | None) -> bool:
     return True
 
 
+def _install_crash_logging():
+    """Send uncaught exceptions to stderr (captured by the systemd journal when
+    run as a user service: journalctl --user -u whiscribe-tray)."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    def _hook(exc_type, exc, tb):
+        logging.critical("Uncaught exception:\n%s",
+                         "".join(traceback.format_exception(exc_type, exc, tb)))
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+
 def main():
+    _install_crash_logging()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("whiscribe-tray")

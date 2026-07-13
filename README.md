@@ -158,17 +158,26 @@ microphone from its menu (remembered across restarts) and edit settings via
 
 ### Install
 
-```bash
-chmod +x tray.py
-ln -s "$(pwd)/tray.py" ~/.local/bin/whiscribe-tray
+Run the installer — it symlinks `whiscribe` and `whiscribe-tray` onto your PATH,
+installs the app icon, adds a **Multimedia** menu entry, and sets up a systemd user
+service that starts the tray at login and logs to the journal:
 
-# Autostart on login (KDE reads ~/.config/autostart)
-cp whiscribe-tray.desktop ~/.config/autostart/
+```bash
+./install.sh
+systemctl --user start whiscribe-tray     # start now (also autostarts on login)
+```
+
+Useful commands:
+
+```bash
+journalctl --user -u whiscribe-tray -e     # view logs / crashes
+systemctl --user restart whiscribe-tray    # after pulling changes
+systemctl --user disable --now whiscribe-tray   # stop autostarting
 ```
 
 ### Usage
 
-Launch `whiscribe-tray` (or log in with autostart enabled). Left-click the tray icon
+Log in (the service autostarts it) or run `whiscribe-tray`. Left-click the tray icon
 or use the menu:
 
 - **Record to clipboard** / **Record to file…** — start recording; **Stop recording** ends it and transcribes.

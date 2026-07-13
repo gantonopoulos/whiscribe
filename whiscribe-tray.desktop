@@ -1,10 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=whiscribe (tray)
+Name=Whiscribe
 GenericName=Voice Dictation
 Comment=Record and transcribe speech from the system tray
 Exec=whiscribe-tray
-Icon=audio-input-microphone
+Icon=whiscribe
 Terminal=false
-Categories=Utility;AudioVideo;
-X-GNOME-Autostart-enabled=true
+Categories=AudioVideo;Audio;
+StartupNotify=false
+Keywords=voice;dictation;transcribe;whisper;speech;
