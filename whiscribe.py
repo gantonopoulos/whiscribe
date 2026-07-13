@@ -11,21 +11,66 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from typing import NamedTuple
 
 
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
-DEFAULT_MODEL = SCRIPT_DIR / "llm_models" / "ggml-small.bin"
+
+# Whisper models live here; the config file names one by filename.
+MODELS_DIR = SCRIPT_DIR / "llm_models"
 
 # Voice Activity Detection model. Auto-enabled when present; download from
 # https://huggingface.co/ggml-org/whisper-vad and place in llm_models/.
-DEFAULT_VAD_MODEL = SCRIPT_DIR / "llm_models" / "ggml-silero-v5.1.2.bin"
+DEFAULT_VAD_MODEL = MODELS_DIR / "ggml-silero-v5.1.2.bin"
 
-# Quality tuning passed to whisper-cli. Tighter than whisper.cpp defaults
-# (no-speech 0.60, logprob -1.00) to reject low-confidence / silent segments
-# that Whisper otherwise hallucinates text into.
-NO_SPEECH_THRESHOLD = "0.45"
-LOGPROB_THRESHOLD = "-0.7"
+# --- Configuration --------------------------------------------------------
+# Hand-edited TOML at ~/.config/whiscribe/config.toml. CLI flags override it.
+CONFIG_DIR = pathlib.Path(
+    os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")
+) / "whiscribe"
+CONFIG_PATH = CONFIG_DIR / "config.toml"
+
+DEFAULT_CONFIG = {
+    "model": "ggml-large-v3.bin",  # filename inside llm_models/
+    "threads": 4,
+    "language": "",                # "" = auto-detect
+    "vad": True,
+    "timestamps": False,
+}
+
+CONFIG_TEMPLATE = """\
+# whiscribe configuration
+
+# Whisper model filename, looked up in the llm_models/ directory next to
+# whiscribe.py. Download models from
+# https://huggingface.co/ggerganov/whisper.cpp
+#   ggml-large-v3.bin        best accuracy (needs a capable GPU)
+#   ggml-large-v3-turbo.bin  near-large accuracy, much faster
+#   ggml-small.bin           lightweight CPU-friendly fallback
+model = "ggml-large-v3.bin"
+
+# Threads for whisper inference.
+threads = 4
+
+# Language hint, e.g. "en" or "el". Leave empty for auto-detect.
+language = ""
+
+# Strip non-speech regions before transcription (needs the Silero VAD model
+# in llm_models/). Strongly recommended — reduces hallucinated output.
+vad = true
+
+# Include whisper timestamps in the output.
+timestamps = false
+"""
+
+# VAD tuning passed to whisper-cli. whisper.cpp pads detected speech by only
+# 30 ms, which clips word onsets/endings; widen it so no words are lost. Also
+# require a longer silence before splitting so mid-sentence pauses don't cut
+# words. VAD (not tightened decode thresholds) is our hallucination defense —
+# tightening --no-speech/--logprob risks dropping real quiet speech.
+VAD_SPEECH_PAD_MS = "200"
+VAD_MIN_SILENCE_MS = "500"
 
 # Native Whisper input format — recording here avoids a downsample step.
 RECORD_RATE = "16000"
@@ -121,6 +166,17 @@ def _parse_bt_cards_needing_switch(output: str) -> list[dict]:
     return cards
 
 
+def _mac_key(name: str) -> str | None:
+    """Extract a Bluetooth MAC from a bluez source/card name as a normalized key
+    (lowercase hex, no separators). PipeWire names sources with colons
+    (bluez_input.04:52:C7:...) but cards with underscores (bluez_card.04_52_C7_...),
+    so both must collapse to the same key to match a source with its card."""
+    m = re.search(r"bluez[._][a-z]+\.([0-9A-Fa-f]+(?:[:_][0-9A-Fa-f]+)+)", name)
+    if not m:
+        return None
+    return re.sub(r"[^0-9a-f]", "", m.group(1).lower())
+
+
 def list_input_devices() -> list[InputDevice]:
     """Return all recording-capable devices, including BT cards currently in A2DP mode."""
     devices: list[InputDevice] = []
@@ -134,9 +190,9 @@ def list_input_devices() -> list[InputDevice]:
             bt_target_profile=None,
             bt_saved_profile=None,
         ))
-        mac_m = re.search(r"bluez[._][a-z]+\.([0-9A-Fa-f_]+)", source_name, re.IGNORECASE)
-        if mac_m:
-            bt_macs_covered.add(mac_m.group(1))
+        mac = _mac_key(source_name)
+        if mac:
+            bt_macs_covered.add(mac)
 
     try:
         result = subprocess.run(
@@ -144,8 +200,7 @@ def list_input_devices() -> list[InputDevice]:
             capture_output=True, text=True, check=True,
         )
         for card in _parse_bt_cards_needing_switch(result.stdout):
-            mac_m = re.search(r"bluez_card\.([0-9A-Fa-f_]+)", card["name"], re.IGNORECASE)
-            mac = mac_m.group(1) if mac_m else None
+            mac = _mac_key(card["name"])
             if mac and mac in bt_macs_covered:
                 continue
             devices.append(InputDevice(
@@ -171,15 +226,14 @@ def switch_bt_profile(card_name: str, profile: str) -> None:
 
 def find_bt_source_after_switch(bt_card_name: str, timeout: float = 3.0) -> str | None:
     """Poll until the BT card exposes an input source; return its name or None."""
-    mac_m = re.search(r"bluez_card\.([0-9A-Fa-f_]+)", bt_card_name, re.IGNORECASE)
-    if not mac_m:
+    mac = _mac_key(bt_card_name)
+    if not mac:
         return None
-    mac = mac_m.group(1).lower()
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for source_name, _ in list_audio_sources():
-            if mac in source_name.lower():
+            if _mac_key(source_name) == mac:
                 return source_name
         time.sleep(0.5)
 
@@ -291,13 +345,21 @@ def transcribe(
         "-m", str(model_path),
         "-f", str(wav_path),
         "-t", str(threads),
-        "--no-speech-thold", NO_SPEECH_THRESHOLD,
-        "--logprob-thold", LOGPROB_THRESHOLD,
+        # No cross-segment text context: Whisper repetition loops are fed by the
+        # model conditioning on its own prior (already-repeating) output, so
+        # zeroing the carried context is the structural cure for runaway repeats.
+        "-mc", "0",
+        # Suppress non-speech tokens (blank-audio / music markers).
+        "--suppress-nst",
     ]
     # VAD strips non-speech regions before inference — the biggest single
     # reducer of hallucinated text on silence. Only usable if the model is present.
     if vad_model and vad_model.exists():
-        cmd += ["--vad", "--vad-model", str(vad_model)]
+        cmd += [
+            "--vad", "--vad-model", str(vad_model),
+            "--vad-speech-pad-ms", VAD_SPEECH_PAD_MS,
+            "--vad-min-silence-duration-ms", VAD_MIN_SILENCE_MS,
+        ]
     if no_gpu:
         cmd.append("--no-gpu")
     if language:
@@ -350,13 +412,83 @@ def strip_timestamps(text: str) -> str:
     return re.sub(r"\[[\d:.]+ --> [\d:.]+\]\s*", "", text).strip()
 
 
-def collapse_trailing_repeats(text: str) -> str:
-    """Drop consecutive identical trailing lines — a common Whisper hallucination
-    loop (e.g. repeated 'Thank you.') on trailing near-silence."""
-    lines = text.split("\n")
-    while len(lines) >= 2 and lines[-1].strip() and lines[-1].strip() == lines[-2].strip():
-        lines.pop()
-    return "\n".join(lines)
+def collapse_repeats(text: str) -> str:
+    """Collapse any run of consecutive identical lines to a single occurrence.
+    Whisper repetition loops emit the same line many times (anywhere in the
+    output, not just at the end); real dictation almost never repeats a full
+    line verbatim back-to-back."""
+    out: list[str] = []
+    for line in text.split("\n"):
+        if out and out[-1].strip() and line.strip() == out[-1].strip():
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def set_clipboard(text: str) -> bool:
+    """Copy text to the clipboard. Prefers wl-copy (Wayland); falls back to KDE
+    Klipper over D-Bus so it still works when wl-clipboard isn't installed.
+    Returns True if some method succeeded."""
+    if shutil.which("wl-copy"):
+        subprocess.run(["wl-copy"], input=text, text=True, check=False)
+        subprocess.run(["wl-copy", "--primary"], input=text, text=True, check=False)
+        return True
+
+    for qdbus in ("qdbus6", "qdbus"):
+        if shutil.which(qdbus):
+            result = subprocess.run(
+                [qdbus, "org.kde.klipper", "/klipper", "setClipboardContents", text],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    """Load ~/.config/whiscribe/config.toml, creating it from a template on first
+    run. Unknown/missing keys fall back to DEFAULT_CONFIG."""
+    cfg = dict(DEFAULT_CONFIG)
+
+    if not CONFIG_PATH.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+        print(f"Created default config: {CONFIG_PATH}")
+
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        print(f"Config error in {CONFIG_PATH}: {exc}\nUsing built-in defaults.")
+        return cfg
+
+    for key in cfg:
+        if key in data:
+            cfg[key] = data[key]
+    return cfg
+
+
+def available_models() -> list[str]:
+    """Whisper .bin models present in llm_models/ (excludes the VAD model)."""
+    if not MODELS_DIR.is_dir():
+        return []
+    return sorted(
+        p.name for p in MODELS_DIR.glob("*.bin") if "silero" not in p.name.lower()
+    )
+
+
+def resolve_model_path(name: str) -> pathlib.Path:
+    """Resolve a model name to a path. Bare filenames resolve inside llm_models/;
+    paths (absolute or containing a separator) are used as given."""
+    candidate = pathlib.Path(name).expanduser()
+    if candidate.is_absolute() or os.sep in name:
+        return candidate
+    return MODELS_DIR / name
 
 
 # ---------------------------------------------------------------------------
@@ -365,14 +497,15 @@ def collapse_trailing_repeats(text: str) -> str:
 
 
 def main() -> None:
+    cfg = load_config()
     parser = argparse.ArgumentParser(
         description="Record audio and transcribe with whisper.cpp",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "-m", "--model", type=pathlib.Path, default=DEFAULT_MODEL,
-        metavar="FILE",
-        help="Path to whisper .bin model file",
+        "-m", "--model", metavar="NAME", default=None,
+        help=f"Override the config model (default from config: {cfg['model']}). "
+             "Bare names resolve inside llm_models/.",
     )
     parser.add_argument(
         "-o", "--output", type=pathlib.Path,
@@ -380,17 +513,17 @@ def main() -> None:
         help="Save transcript to this file path (default: clipboard only, no file saved)",
     )
     parser.add_argument(
-        "-t", "--threads", type=int, default=4,
+        "-t", "--threads", type=int, default=cfg["threads"],
         help="Number of threads for whisper inference",
     )
     parser.add_argument(
-        "-l", "--language",
+        "-l", "--language", default=cfg["language"] or None,
         metavar="LANG",
         help="Language code hint for whisper (e.g. 'en', 'el'); auto-detect if omitted",
     )
     parser.add_argument(
-        "--timestamps", action="store_true",
-        help="Include whisper timestamps in output (default: plain text)",
+        "--timestamps", action=argparse.BooleanOptionalAction, default=cfg["timestamps"],
+        help="Include whisper timestamps in output",
     )
     parser.add_argument(
         "--clip", action="store_true",
@@ -402,16 +535,24 @@ def main() -> None:
         help="Silero VAD model; enables speech-region filtering when the file exists",
     )
     parser.add_argument(
-        "--no-vad", action="store_true",
-        help="Disable Voice Activity Detection even if a VAD model is present",
+        "--vad", action=argparse.BooleanOptionalAction, default=cfg["vad"],
+        help="Strip non-speech regions before transcription (needs the VAD model)",
     )
 
     args = parser.parse_args()
 
-    if not args.model.exists():
-        sys.exit(f"Model not found: {args.model}")
+    # --- resolve the model: CLI overrides config; must exist in llm_models/ ---
+    model_path = resolve_model_path(args.model or cfg["model"])
+    if not model_path.exists():
+        have = available_models()
+        listing = "\n  ".join(have) if have else "(none)"
+        sys.exit(
+            f"Model not found: {model_path}\n"
+            f"Set 'model' in {CONFIG_PATH} to one of the models in {MODELS_DIR}:\n"
+            f"  {listing}"
+        )
 
-    vad_model = None if args.no_vad else args.vad_model
+    vad_model = args.vad_model if args.vad else None
     if vad_model and not vad_model.exists():
         print(f"Note: VAD model not found at {vad_model} — transcribing without VAD.")
 
@@ -454,7 +595,7 @@ def main() -> None:
 
         # --- transcribe (GPU first, CPU fallback) ---
         raw_text = transcribe_with_gpu_fallback(
-            wav_path, args.model, args.threads, args.language, vad_model=vad_model)
+            wav_path, model_path, args.threads, args.language, vad_model=vad_model)
         print()
     finally:
         wav_path.unlink(missing_ok=True)
@@ -463,7 +604,7 @@ def main() -> None:
         print("Warning: whisper returned empty output.")
 
     final_text = raw_text if args.timestamps else strip_timestamps(raw_text)
-    final_text = collapse_trailing_repeats(final_text)
+    final_text = collapse_repeats(final_text)
 
     # --- save to file if -o given ---
     if args.output:
@@ -474,12 +615,10 @@ def main() -> None:
     # --- clipboard: always in default mode; only with --clip when -o is given ---
     copy_to_clipboard = (args.output is None) or args.clip
     if copy_to_clipboard:
-        if shutil.which("wl-copy"):
-            subprocess.run(["wl-copy"], input=final_text, text=True, check=False)
-            subprocess.run(["wl-copy", "--primary"], input=final_text, text=True, check=False)
-            print("Copied to clipboard and primary selection.")
+        if set_clipboard(final_text):
+            print("Copied to clipboard.")
         else:
-            print("wl-copy not found — clipboard not updated.")
+            print("Clipboard not updated — install wl-clipboard (or start KDE Klipper).")
 
 
 if __name__ == "__main__":

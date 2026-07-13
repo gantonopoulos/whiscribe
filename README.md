@@ -13,12 +13,13 @@ Targets KDE Plasma / Wayland on Manjaro Linux, but should work on any PipeWire/P
 | `whisper-cli` | `whisper.cpp` (AUR) | transcription engine |
 | `arecord` | `alsa-utils` | audio recording |
 | `pactl` | `libpulse` | device enumeration + BT profile switching |
-| `wl-copy` | `wl-clipboard` | Wayland clipboard |
+| `wl-copy` | `wl-clipboard` | Wayland clipboard (optional; falls back to KDE Klipper via `qdbus`) |
 | `stdbuf` | `coreutils` | live transcription output (optional) |
 
 ### Python
 
-Python 3.10 or newer. No pip dependencies — only standard library modules are used.
+Python 3.11 or newer (the config reader uses the stdlib `tomllib` module). No pip
+dependencies — only standard library modules are used.
 
 ### GPU acceleration (optional)
 
@@ -87,24 +88,45 @@ whiscribe.py [options]
 On launch an interactive device picker lets you choose the input device with arrow keys.
 Press **Ctrl+C** to stop recording. Transcription starts automatically.
 
+### Configuration
+
+On first run whiscribe writes a commented config file to
+`~/.config/whiscribe/config.toml` (respecting `XDG_CONFIG_HOME`). Edit it to set your
+defaults — most importantly the model, given by filename and looked up in `llm_models/`:
+
+```toml
+model = "ggml-large-v3.bin"   # filename inside llm_models/
+threads = 4
+language = ""                 # "" = auto-detect
+vad = true
+timestamps = false
+```
+
+If the configured model isn't in `llm_models/`, whiscribe exits with an error listing
+the models it did find. Command-line flags below override the config per run.
+
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-m, --model FILE` | `llm_models/ggml-small.bin` | whisper model to use |
+| `-m, --model NAME` | from config | override the config model (bare name resolves in `llm_models/`) |
 | `-o, --output FILE` | — | save transcript to this file (default: clipboard only) |
-| `-t, --threads N` | `4` | inference thread count |
-| `-l, --language LANG` | auto-detect | language hint, e.g. `en`, `el` |
-| `--timestamps` | off | include whisper timestamps in output |
+| `-t, --threads N` | from config | inference thread count |
+| `-l, --language LANG` | from config | language hint, e.g. `en`, `el` |
+| `--timestamps / --no-timestamps` | from config | include whisper timestamps in output |
 | `--clip` | off | also copy to clipboard when `-o` is given |
-| `--vad-model FILE` | `llm_models/ggml-silero-v5.1.2.bin` | Silero VAD model; used automatically when the file exists |
-| `--no-vad` | off | disable VAD even if a VAD model is present |
+| `--vad-model FILE` | `llm_models/ggml-silero-v5.1.2.bin` | Silero VAD model path |
+| `--vad / --no-vad` | from config | strip non-speech regions before transcription |
 
 GPU inference via Vulkan is tried automatically first; falls back to CPU if unavailable.
 
-Recording is captured at 16 kHz mono (Whisper's native format), and transcription
-uses tightened no-speech/log-probability thresholds plus trailing-repeat cleanup to
-reduce hallucinated output.
+Clipboard uses `wl-copy` when available, falling back to KDE Klipper over D-Bus.
+
+Recording is captured at 16 kHz mono (Whisper's native format). When the VAD model
+is present, non-speech regions are stripped before inference (with padded speech
+segments so words aren't clipped). Runaway repetition loops are prevented by disabling
+cross-segment context carry, and any residual consecutive-duplicate lines are collapsed —
+together the main defenses against hallucinated output.
 
 ### Examples
 

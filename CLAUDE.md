@@ -36,7 +36,17 @@ Key design points worth knowing before editing:
 - **The WAV is always a temp file and always deleted** (`tempfile.mkstemp` → `unlink` in `finally`). `-o` controls only the transcript text output, never the audio.
 - **Output model:** clipboard-first. With no `-o`, transcript goes to the clipboard. With `-o`, it goes to the file only, unless `--clip` is also passed. See `copy_to_clipboard` logic near the end of `main()`.
 - **Timestamp handling:** whisper prints `[hh:mm:ss --> hh:mm:ss]` prefixes; `strip_timestamps()` regex-removes them unless `--timestamps` is set.
-- **Transcription quality:** recording is 16 kHz mono (Whisper-native). `transcribe()` passes tightened `--no-speech-thold`/`--logprob-thold` to whisper-cli and, when `DEFAULT_VAD_MODEL` exists in `llm_models/`, `--vad --vad-model` (auto-enabled, opt-out via `--no-vad`). `collapse_trailing_repeats()` drops duplicated trailing lines (a common Whisper hallucination loop). These thresholds are module constants near the top of the file.
+- **Transcription quality:** recording is 16 kHz mono (Whisper-native). Hallucination defense is VAD-based, not decode-threshold-based (tightening `--no-speech`/`--logprob` risks dropping real quiet speech). When `DEFAULT_VAD_MODEL` exists in `llm_models/`, `transcribe()` passes `--vad --vad-model` with widened `--vad-speech-pad-ms`/`--vad-min-silence-duration-ms` (module constants) so words aren't clipped; auto-enabled, opt-out via `--no-vad`. Repetition-loop defense is two-layer: `-mc 0` (no cross-segment context carry) stops runaway repeats forming, and `collapse_repeats()` flattens any run of consecutive identical lines (anywhere, not just trailing) as a backstop. `--suppress-nst` drops non-speech tokens.
+- **Bluetooth MAC matching:** PipeWire names BT sources with colons (`bluez_input.04:52:...`) but cards with underscores (`bluez_card.04_52_...`). `_mac_key()` normalizes both to separator-free lowercase hex; all source↔card matching (dedup, post-switch source discovery) must go through it, or devices double-list and profile-switch waits time out.
+
+## Configuration
+
+`load_config()` reads `~/.config/whiscribe/config.toml` (XDG), writing a commented
+template on first run. Config supplies argparse **defaults**; CLI flags override per run.
+The `model` key is a filename resolved inside `llm_models/` by `resolve_model_path()`
+(bare name → `llm_models/`; path with a separator → used as-is); a missing model exits
+with an error listing `available_models()`. Reading uses stdlib `tomllib` (Python 3.11+);
+there is no config writer, so the tray app (future) will need one or a separate store.
 
 ## Models
 
