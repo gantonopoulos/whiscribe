@@ -21,8 +21,12 @@ cp "$REPO/whiscribe.svg" "$ICONDIR/whiscribe.svg"
 # --- menu entry (Multimedia) ----------------------------------------------
 APPDIR=~/.local/share/applications
 mkdir -p "$APPDIR"
-cp "$REPO/whiscribe-tray.desktop" "$APPDIR/whiscribe-tray.desktop"
+# Reference the icon by absolute path so it renders even if the icon-theme
+# cache hasn't picked up the newly added name.
+sed "s|^Icon=whiscribe$|Icon=$ICONDIR/whiscribe.svg|" \
+    "$REPO/whiscribe-tray.desktop" > "$APPDIR/whiscribe-tray.desktop"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPDIR" || true
+command -v kbuildsycoca6 >/dev/null 2>&1 && kbuildsycoca6 >/dev/null 2>&1 || true
 command -v gtk-update-icon-cache  >/dev/null 2>&1 && gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor 2>/dev/null || true
 
 # --- systemd user service (autostart on login + journal logging) ----------
