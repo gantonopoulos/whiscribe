@@ -3,10 +3,8 @@ lifting lives in backend.py; this module is the terminal front end."""
 
 import argparse
 import curses
-import os
 import pathlib
 import sys
-import tempfile
 import threading
 
 import backend
@@ -216,10 +214,13 @@ def main() -> None:
     except RuntimeError as exc:
         sys.exit(str(exc))
 
-    # --- WAV goes to a temp file, always deleted after transcription ---
-    tmp_fd, tmp_wav = tempfile.mkstemp(suffix=".wav", prefix="whiscribe_")
-    os.close(tmp_fd)
-    wav_path = pathlib.Path(tmp_wav)
+    # --- the WAV is kept in recordings/ (see auto_delete / warn_size_mb) ---
+    if cfg["auto_delete"]:
+        backend.purge_recordings(max_age_hours=cfg["auto_delete_hours"])
+    warning = backend.size_warning(cfg)
+    if warning:
+        print(f"Warning: {warning}")
+    wav_path = backend.new_recording_path()
 
     # --- record; always restore BT profile in finally ---
     try:
@@ -229,19 +230,18 @@ def main() -> None:
             print("Restoring Bluetooth profile...")
             backend.switch_bt_profile(bt_card, bt_saved_profile)
 
-    try:
-        if not wav_path.exists() or wav_path.stat().st_size < 1024:
-            sys.exit("No usable recording — WAV file is missing or too small.")
-
-        # --- transcribe (GPU first, CPU fallback) ---
-        try:
-            raw_text = backend.transcribe_with_gpu_fallback(
-                wav_path, model_path, args.threads, args.language, vad_model=vad_model)
-        except RuntimeError as exc:
-            sys.exit(str(exc))
-        print()
-    finally:
+    if not wav_path.exists() or wav_path.stat().st_size < 1024:
         wav_path.unlink(missing_ok=True)
+        sys.exit("No usable recording — WAV file is missing or too small.")
+    print(f"Recording kept: {wav_path}")
+
+    # --- transcribe (GPU first, CPU fallback) ---
+    try:
+        raw_text = backend.transcribe_with_gpu_fallback(
+            wav_path, model_path, args.threads, args.language, vad_model=vad_model)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
+    print()
 
     if not raw_text:
         print("Warning: whisper returned empty output.")

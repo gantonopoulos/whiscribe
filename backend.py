@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import tomllib
+from datetime import datetime, timedelta
 from typing import NamedTuple
 
 
@@ -23,6 +24,11 @@ SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
 
 # Whisper models live here; the config file names one by filename.
 MODELS_DIR = SCRIPT_DIR / "llm_models"
+
+# Every recording's WAV is kept here (finished or cancelled); the transcript
+# text is never stored. Named by start time, e.g. 2026-11-08_14-03-22.wav.
+RECORDINGS_DIR = SCRIPT_DIR / "recordings"
+RECORDING_FMT = "%Y-%m-%d_%H-%M-%S"
 
 # Voice Activity Detection model. Auto-enabled when present; download from
 # https://huggingface.co/ggml-org/whisper-vad and place in llm_models/.
@@ -75,6 +81,10 @@ DEFAULT_CONFIG = {
     "language": "",                # "" = auto-detect
     "vad": True,
     "timestamps": False,
+    "delete_on_start": True,       # wipe all saved recordings at app start
+    "auto_delete": True,           # periodically delete old recordings
+    "auto_delete_hours": 24,       # age threshold (and check is hourly)
+    "warn_size_mb": 1024,          # warn when saved recordings exceed this
 }
 
 CONFIG_TEMPLATE = """\
@@ -100,6 +110,19 @@ vad = true
 
 # Include whisper timestamps in the output.
 timestamps = false
+
+# Every recording's audio (WAV) is kept in the recordings/ directory next to
+# whiscribe.py, whether it finished or was cancelled. Delete all of them each
+# time the tray app starts.
+delete_on_start = true
+
+# While running, delete recordings older than auto_delete_hours (checked
+# hourly and before each recording).
+auto_delete = true
+auto_delete_hours = 24
+
+# Warn when saved recordings use more than this many MB (1024 = 1 GB).
+warn_size_mb = 1024
 """
 
 # Per-key help for GUIs (tooltips); mirrors the comments in CONFIG_TEMPLATE.
@@ -110,6 +133,13 @@ CONFIG_HELP = {
     "vad": "Strip non-speech regions before transcription (needs the Silero "
            "VAD model). Strongly recommended — reduces hallucinated output.",
     "timestamps": "Include whisper timestamps in the output.",
+    "delete_on_start": "Delete all saved recordings each time the tray app starts.",
+    "auto_delete": "While running, periodically delete recordings older than the "
+                   "age limit.",
+    "auto_delete_hours": "Recordings older than this many hours are deleted "
+                         "(checked hourly and before each recording).",
+    "warn_size_mb": "Show a warning when saved recordings exceed this size in MB "
+                    "(1024 = 1 GB).",
 }
 
 # VAD tuning passed to whisper-cli. whisper.cpp pads detected speech by only
@@ -633,3 +663,76 @@ def save_config(updates: dict) -> None:
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(CONFIG_PATH)
 
+
+# ---------------------------------------------------------------------------
+# Saved recordings
+# ---------------------------------------------------------------------------
+
+def new_recording_path() -> pathlib.Path:
+    """Path for a new recording, named by the current time (second granularity)."""
+    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    return RECORDINGS_DIR / (datetime.now().strftime(RECORDING_FMT) + ".wav")
+
+
+def list_recordings() -> list[tuple[datetime, pathlib.Path]]:
+    """Saved recordings, newest first. The time comes from the filename (not
+    mtime, which changes when files are copied or touched)."""
+    if not RECORDINGS_DIR.is_dir():
+        return []
+    found = []
+    for p in RECORDINGS_DIR.glob("*.wav"):
+        try:
+            found.append((datetime.strptime(p.stem, RECORDING_FMT), p))
+        except ValueError:
+            continue   # not one of ours; leave it alone
+    return sorted(found, reverse=True)
+
+
+def recordings_size() -> int:
+    """Total bytes used by saved recordings."""
+    total = 0
+    for _, p in list_recordings():
+        try:
+            total += p.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def delete_recording(path: pathlib.Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+def purge_recordings(
+    max_age_hours: float | None = None,
+    keep: tuple | list = (),
+) -> int:
+    """Delete saved recordings older than max_age_hours (None = all of them).
+    Paths in `keep` (in-flight recordings) are never touched. Returns the
+    number deleted."""
+    cutoff = (None if max_age_hours is None
+              else datetime.now() - timedelta(hours=max_age_hours))
+    keep_set = {pathlib.Path(k).resolve() for k in keep}
+    deleted = 0
+    for when, path in list_recordings():
+        if path.resolve() in keep_set:
+            continue
+        if cutoff is not None and when >= cutoff:
+            continue
+        try:
+            path.unlink()
+            deleted += 1
+        except OSError:
+            pass
+    return deleted
+
+
+def size_warning(cfg: dict) -> str | None:
+    """Message if saved recordings exceed the configured limit, else None."""
+    used = recordings_size()
+    limit = int(cfg["warn_size_mb"]) * 1024 * 1024
+    if limit > 0 and used > limit:
+        return (f"Saved recordings use {used / 1024**3:.1f} GB "
+                f"(limit {limit / 1024**3:.1f} GB) — clear them in "
+                f"Previous transcriptions")
+    return None

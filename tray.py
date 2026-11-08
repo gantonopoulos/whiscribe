@@ -8,10 +8,8 @@ recording/transcription logic lives in backend.py."""
 
 import json
 import logging
-import os
 import pathlib
 import sys
-import tempfile
 import threading
 import traceback
 
@@ -21,7 +19,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from PySide6.QtCore import QThread, Signal, QTimer
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import (
-    QApplication, QSystemTrayIcon, QMenu, QFileDialog, QWidget,
+    QApplication, QSystemTrayIcon, QMenu, QFileDialog, QWidget, QMessageBox,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -65,6 +63,7 @@ class RecordWorker(QThread):
     def __init__(self, device: backend.InputDevice):
         super().__init__()
         self.device = device
+        self.wav_path = backend.new_recording_path()   # kept after recording
         self._recorder: backend.Recorder | None = None
         self._stop_requested = False
 
@@ -82,9 +81,7 @@ class RecordWorker(QThread):
             self.failed.emit(str(exc))
             return
 
-        fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="whiscribe_")
-        os.close(fd)
-        wav_path = pathlib.Path(tmp)
+        wav_path = self.wav_path
 
         try:
             self._recorder = backend.Recorder(source_name, wav_path)
@@ -114,7 +111,7 @@ class RecordWorker(QThread):
 
 class TranscribeWorker(QThread):
     """Transcribes a WAV (GPU then CPU), post-processes, and emits the text.
-    Always deletes the WAV."""
+    The WAV is left in place (it is a saved recording)."""
 
     done = Signal(str)      # transcript
     failed = Signal(str)
@@ -144,8 +141,6 @@ class TranscribeWorker(QThread):
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
             return
-        finally:
-            wav.unlink(missing_ok=True)
 
         text = raw if self.cfg["timestamps"] else backend.strip_timestamps(raw)
         text = backend.collapse_repeats(text)
@@ -225,6 +220,11 @@ class WhisperTray(QWidget):
         self._selected_device: backend.InputDevice | None = None
         self._settings = None
 
+        self._startup_purge()
+        self._purge_timer = QTimer(self)
+        self._purge_timer.timeout.connect(self._periodic_purge)
+        self._purge_timer.start(60 * 60 * 1000)   # hourly
+
         self._setup_tray()   # creates self.tray and self.status
         self._setup_ipc()
 
@@ -285,6 +285,10 @@ class WhisperTray(QWidget):
         self.act_model.setEnabled(False)
         self.menu.addAction(self.act_model)
 
+        self.history_menu = QMenu("Previous transcriptions", self.menu)
+        self.history_menu.aboutToShow.connect(self._populate_history)
+        self.menu.addMenu(self.history_menu)
+
         self.act_settings = QAction("Settings…", self)
         self.act_settings.triggered.connect(self._open_settings)
         self.menu.addAction(self.act_settings)
@@ -343,6 +347,91 @@ class WhisperTray(QWidget):
         self._selected_device = device
         self.state["device_label"] = device.label
         self._save_state()
+
+    # --- saved recordings -------------------------------------------------
+
+    def _in_use(self) -> list:
+        """Recordings that are being captured or transcribed right now."""
+        paths = []
+        if self._record_worker and self._record_worker.isRunning():
+            paths.append(self._record_worker.wav_path)
+        if self._transcribe_worker and self._transcribe_worker.isRunning():
+            paths.append(pathlib.Path(self._transcribe_worker.wav_path))
+        return paths
+
+    def _startup_purge(self):
+        try:
+            if self.cfg["delete_on_start"]:
+                backend.purge_recordings()
+            elif self.cfg["auto_delete"]:
+                backend.purge_recordings(self.cfg["auto_delete_hours"])
+        except OSError:
+            logging.exception("startup purge failed")
+
+    def _periodic_purge(self):
+        self.cfg = backend.load_config()
+        if self.cfg["auto_delete"]:
+            backend.purge_recordings(self.cfg["auto_delete_hours"], keep=self._in_use())
+
+    def _populate_history(self):
+        self.history_menu.clear()
+        recs = backend.list_recordings()
+        busy = self._recording or self._transcribing
+        in_use = {p.resolve() for p in self._in_use()}
+
+        if not recs:
+            empty = QAction("(no saved recordings)", self.history_menu)
+            empty.setEnabled(False)
+            self.history_menu.addAction(empty)
+            return
+
+        size_mb = backend.recordings_size() / (1024 * 1024)
+        info = QAction(f"{len(recs)} recordings, {size_mb:.0f} MB", self.history_menu)
+        info.setEnabled(False)
+        self.history_menu.addAction(info)
+        self.history_menu.addSeparator()
+
+        for when, path in recs:
+            sub = QMenu(when.strftime("%Y-%m-%d  %H:%M:%S"), self.history_menu)
+            act_re = sub.addAction("Re-transcribe to clipboard")
+            act_re.setEnabled(not busy)
+            act_re.triggered.connect(lambda _c=False, p=path: self._retranscribe(p))
+            act_play = sub.addAction("Play")
+            act_play.triggered.connect(lambda _c=False, p=path: self._play(p))
+            act_del = sub.addAction("Delete")
+            act_del.setEnabled(path.resolve() not in in_use)
+            act_del.triggered.connect(lambda _c=False, p=path: backend.delete_recording(p))
+            self.history_menu.addMenu(sub)
+
+        self.history_menu.addSeparator()
+        act_clear = self.history_menu.addAction("Clear transcriptions…")
+        act_clear.triggered.connect(self._clear_recordings)
+
+    def _clear_recordings(self):
+        count = len(backend.list_recordings())
+        if not count:
+            return
+        answer = QMessageBox.question(
+            None, "Clear transcriptions",
+            f"Permanently delete all {count} saved recordings?",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            backend.purge_recordings(keep=self._in_use())
+
+    def _play(self, path: pathlib.Path):
+        import subprocess
+        subprocess.Popen(["xdg-open", str(path)])
+
+    def _retranscribe(self, path: pathlib.Path):
+        if self._recording or self._transcribing:
+            return
+        self.cfg = backend.load_config()
+        if not backend.resolve_model_path(self.cfg["model"]).exists():
+            self.status.show_error(f"Model not found: {self.cfg['model']}")
+            self._open_settings()
+            return
+        self._output_file = None   # re-transcribe always goes to the clipboard
+        self._begin_transcribe(str(path))
 
     def _open_settings(self):
         if self._settings is not None:
@@ -403,6 +492,12 @@ class WhisperTray(QWidget):
             self._open_settings()
             return
 
+        if self.cfg["auto_delete"]:
+            backend.purge_recordings(self.cfg["auto_delete_hours"], keep=self._in_use())
+        warning = backend.size_warning(self.cfg)
+        if warning:
+            self.status.show_error(warning)
+
         self._output_file = None
         if to_file:
             default_dir = pathlib.Path.home()
@@ -429,13 +524,15 @@ class WhisperTray(QWidget):
 
     def _on_recorded(self, wav_path: str):
         if self._cancelled:
-            self._cancelled = False
-            pathlib.Path(wav_path).unlink(missing_ok=True)
+            self._cancelled = False   # audio is kept in recordings/
             self._reset_idle()
             self.status.show_error("Cancelled")
             return
 
         self._recording = False
+        self._begin_transcribe(wav_path)
+
+    def _begin_transcribe(self, wav_path: str):
         self._transcribing = True
         self._set_busy_ui("busy")
         self.status.show_transcribing()

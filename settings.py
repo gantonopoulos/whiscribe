@@ -55,6 +55,7 @@ class SettingsDialog(QDialog):
         root = QVBoxLayout(self)
         root.addWidget(self._build_models())
         root.addWidget(self._build_options())
+        root.addWidget(self._build_recordings())
 
         # Shared progress row for whichever download is running.
         self.progress_label = QLabel()
@@ -136,6 +137,45 @@ class SettingsDialog(QDialog):
         self.timestamps.setChecked(bool(self.cfg["timestamps"]))
         self.timestamps.setToolTip(backend.CONFIG_HELP["timestamps"])
         form.addRow(self.timestamps)
+        return box
+
+    def _build_recordings(self) -> QGroupBox:
+        box = QGroupBox("Saved recordings")
+        form = QFormLayout(box)
+
+        recs = backend.list_recordings()
+        mb = backend.recordings_size() / (1024 * 1024)
+        form.addRow(self._hint(
+            f"Audio of every recording is kept in {backend.RECORDINGS_DIR} "
+            f"(currently {len(recs)} files, {mb:.0f} MB)."))
+
+        self.delete_on_start = QCheckBox("Delete all when the app starts")
+        self.delete_on_start.setChecked(bool(self.cfg["delete_on_start"]))
+        self.delete_on_start.setToolTip(backend.CONFIG_HELP["delete_on_start"])
+        form.addRow(self.delete_on_start)
+
+        self.auto_delete = QCheckBox("Delete old recordings while running")
+        self.auto_delete.setChecked(bool(self.cfg["auto_delete"]))
+        self.auto_delete.setToolTip(backend.CONFIG_HELP["auto_delete"])
+        form.addRow(self.auto_delete)
+
+        self.auto_hours = QSpinBox()
+        self.auto_hours.setRange(1, 24 * 365)
+        self.auto_hours.setSuffix(" hours")
+        self.auto_hours.setValue(int(self.cfg["auto_delete_hours"]))
+        self.auto_hours.setToolTip(backend.CONFIG_HELP["auto_delete_hours"])
+        self.auto_hours.setEnabled(self.auto_delete.isChecked())
+        self.auto_delete.toggled.connect(self.auto_hours.setEnabled)
+        form.addRow("Older than", self.auto_hours)
+
+        self.warn_mb = QSpinBox()
+        self.warn_mb.setRange(0, 1_000_000)
+        self.warn_mb.setSingleStep(256)
+        self.warn_mb.setSuffix(" MB")
+        self.warn_mb.setSpecialValueText("never")
+        self.warn_mb.setValue(int(self.cfg["warn_size_mb"]))
+        self.warn_mb.setToolTip(backend.CONFIG_HELP["warn_size_mb"])
+        form.addRow("Warn above", self.warn_mb)
         return box
 
     def _hint(self, text: str) -> QLabel:
@@ -256,6 +296,10 @@ class SettingsDialog(QDialog):
                 "language": self.language.text().strip(),
                 "vad": self.vad.isChecked(),
                 "timestamps": self.timestamps.isChecked(),
+                "delete_on_start": self.delete_on_start.isChecked(),
+                "auto_delete": self.auto_delete.isChecked(),
+                "auto_delete_hours": self.auto_hours.value(),
+                "warn_size_mb": self.warn_mb.value(),
             })
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Could not save", str(exc))

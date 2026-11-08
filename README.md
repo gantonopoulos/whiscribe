@@ -47,6 +47,7 @@ Model weights are not included in this repository. Download them from the
 | `ggml-small.bin` | 466 MB | good CPU trade-off |
 | `ggml-medium.bin` | 1.5 GB | |
 | `ggml-large-v3.bin` | 3.1 GB | best accuracy |
+| `ggml-large-v3-turbo.bin` | 1.6 GB | near-large accuracy, much faster |
 
 Download from the command line, or from **Settings…** in the tray menu:
 
@@ -100,6 +101,11 @@ threads = 4
 language = ""                 # "" = auto-detect
 vad = true
 timestamps = false
+
+delete_on_start = true        # saved recordings: see "Saved recordings" below
+auto_delete = true
+auto_delete_hours = 24
+warn_size_mb = 1024
 ```
 
 If the configured model isn't in `llm_models/`, whiscribe exits with an error listing
@@ -117,6 +123,8 @@ the models it did find. Command-line flags below override the config per run.
 | `--clip` | off | also copy to clipboard when `-o` is given |
 | `--vad-model FILE` | `llm_models/ggml-silero-v5.1.2.bin` | Silero VAD model path |
 | `--vad / --no-vad` | from config | strip non-speech regions before transcription |
+| `--list-models` | — | show downloadable models and whether each is present, then exit |
+| `--download-model NAME` | — | download a model into `llm_models/` (`vad` for the VAD model), then exit |
 
 GPU inference via Vulkan is tried automatically first; falls back to CPU if unavailable.
 
@@ -131,7 +139,7 @@ together the main defenses against hallucinated output.
 ### Examples
 
 ```bash
-# Default — transcript text copied to clipboard, nothing saved to disk
+# Default — transcript text copied to clipboard (audio kept in recordings/)
 whiscribe.py
 
 # Save transcript to a file (clipboard not used)
@@ -146,14 +154,15 @@ whiscribe.py -o ~/notes/meeting.txt --timestamps
 
 ## Output
 
-By default nothing is saved to disk — the transcript text is copied directly to the clipboard. Use `-o FILE` to save to a specific path. The raw WAV recording is always discarded after transcription.
+The transcript text is copied to the clipboard and never stored by default. Use `-o FILE` to save it to a specific path instead. The audio is a different matter: every recording's WAV is kept for a while so a lost transcript can be redone — see [Saved recordings](#saved-recordings).
 
 ## System tray app
 
 `tray.py` is a PySide6 tray front end sharing the same backend (device handling,
 VAD, hallucination defenses, config). It reads the same `config.toml`; pick the
-microphone from its menu (remembered across restarts) and edit settings via
-**Edit config…**.
+microphone from its menu (remembered across restarts), change the model and other
+settings in the **Settings…** window (it can download missing models), or edit the
+file via **Edit config…**.
 
 ### Install
 
@@ -180,7 +189,9 @@ Log in (the service autostarts it) or run `whiscribe-tray`. Left-click the tray 
 or use the menu:
 
 - **Record to clipboard** / **Record to file…** — start recording; **Stop recording** ends it and transcribes.
-- **Cancel** — abort and discard, whether recording (throws away the audio) or transcribing (kills whisper, produces nothing).
+- **Cancel** — abort, whether recording or transcribing (kills whisper, produces no text). The audio stays in **Previous transcriptions**.
+- **Previous transcriptions** — saved recordings by timestamp: re-transcribe to the clipboard, play, or delete; **Clear transcriptions…** deletes all.
+- **Settings…** — model (with download), threads, language, VAD, timestamps and the recording-retention options.
 - Left-clicking the icon toggles recording to the clipboard.
 
 ### Global shortcuts (KDE Wayland)
@@ -193,3 +204,21 @@ commands that message the running instance over a local socket:
 3. Add `whiscribe-tray --cancel` and assign another (e.g. `Ctrl+Meta+X`) — abort/discard.
 
 (`Meta` is the Super/Win key.) Only one instance runs at a time; a second launch exits.
+
+## Saved recordings
+
+Every recording's audio (not the text) is kept in `recordings/` next to the
+program, named by start time, whether it finished or was cancelled. In the tray,
+**Previous transcriptions** lists them; each can be re-transcribed to the
+clipboard, played, or deleted, and **Clear transcriptions…** removes all of them.
+Audio is unencrypted speech on disk, so cleanup is on by default. Settings (all
+editable in **Settings…** or `config.toml`):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `delete_on_start` | `true` | delete all recordings when the tray starts |
+| `auto_delete` | `true` | delete recordings older than the limit (hourly and before each recording) |
+| `auto_delete_hours` | `24` | age limit in hours |
+| `warn_size_mb` | `1024` | warn when saved recordings exceed this size |
+
+Recording uses about 1.9 MB per minute, so 1 GB is roughly 9 hours of audio.

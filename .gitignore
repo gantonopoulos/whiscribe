@@ -17,3 +17,6 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# saved recordings
+recordings/
