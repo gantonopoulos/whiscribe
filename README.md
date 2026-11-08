@@ -48,11 +48,11 @@ Model weights are not included in this repository. Download them from the
 | `ggml-medium.bin` | 1.5 GB | |
 | `ggml-large-v3.bin` | 3.1 GB | best accuracy |
 
-Quick download example (small model):
+Download from the command line, or from **Settings…** in the tray menu:
 
 ```bash
-curl -L "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin" \
-     -o llm_models/ggml-small.bin
+./whiscribe.py --list-models            # what's available / present
+./whiscribe.py --download-model ggml-small.bin
 ```
 
 ### Voice Activity Detection (optional, recommended)
@@ -62,8 +62,7 @@ which sharply reduces hallucinated text on silence. It is enabled automatically
 when the model file is present in `llm_models/`; disable per-run with `--no-vad`.
 
 ```bash
-curl -L "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin" \
-     -o llm_models/ggml-silero-v5.1.2.bin
+./whiscribe.py --download-model vad
 ```
 
 ## Installation

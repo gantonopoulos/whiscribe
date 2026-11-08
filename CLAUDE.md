@@ -10,6 +10,7 @@ A Python 3.11+ voice dictation tool for Linux that orchestrates external CLI bin
 - **`cli.py`** — terminal front end: curses device picker + argparse `main()`. Translates backend exceptions to `sys.exit`.
 - **`whiscribe.py`** — thin shim → `cli.main()` (keeps the PATH symlink working; inserts its resolved dir on `sys.path` so siblings import through a symlink).
 - **`tray.py`** — PySide6 system tray app (the only component needing a third-party dep).
+- **`settings.py`** — PySide6 settings dialog (model pick + download, config keys), opened from the tray's **Settings…** item.
 
 ## Running
 
@@ -55,9 +56,9 @@ template on first run. Config supplies argparse **defaults**; CLI flags override
 The `model` key is a filename resolved inside `llm_models/` by `resolve_model_path()`
 (bare name → `llm_models/`; path with a separator → used as-is); a missing model exits
 with an error listing `available_models()`. Reading uses stdlib `tomllib` (Python 3.11+);
-there is no config writer — the tray stores its own UI state (mic) in `tray_state.json`
-and leaves `config.toml` for hand-editing.
+`save_config()` rewrites individual `key = value` lines in place (comments preserved,
+re-parsed before replacing the file). The tray stores its own UI state (mic) in `tray_state.json`.
 
 ## Models
 
-Model weights are not in the repo (gitignored under `llm_models/*.bin`). The config default is `ggml-large-v3.bin`. See README for download links.
+Model weights are not in the repo (gitignored under `llm_models/*.bin`). `whiscribe --list-models` / `--download-model NAME` (and the Settings dialog) fetch them via `backend.MODEL_CATALOG` / `download_model()`. The config default is `ggml-large-v3.bin`. See README for download links.

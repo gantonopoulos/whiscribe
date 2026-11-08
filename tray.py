@@ -223,6 +223,7 @@ class WhisperTray(QWidget):
         self._output_file: str | None = None
         self._devices: list[backend.InputDevice] = []
         self._selected_device: backend.InputDevice | None = None
+        self._settings = None
 
         self._setup_tray()   # creates self.tray and self.status
         self._setup_ipc()
@@ -284,6 +285,10 @@ class WhisperTray(QWidget):
         self.act_model.setEnabled(False)
         self.menu.addAction(self.act_model)
 
+        self.act_settings = QAction("Settings…", self)
+        self.act_settings.triggered.connect(self._open_settings)
+        self.menu.addAction(self.act_settings)
+
         self.act_edit_cfg = QAction("Edit config…", self)
         self.act_edit_cfg.triggered.connect(self._edit_config)
         self.menu.addAction(self.act_edit_cfg)
@@ -339,6 +344,20 @@ class WhisperTray(QWidget):
         self.state["device_label"] = device.label
         self._save_state()
 
+    def _open_settings(self):
+        if self._settings is not None:
+            self._settings.raise_()
+            self._settings.activateWindow()
+            return
+        from settings import SettingsDialog
+        self._settings = SettingsDialog()
+        self._settings.finished.connect(self._on_settings_closed)
+        self._settings.show()
+
+    def _on_settings_closed(self, _result: int):
+        self._settings = None
+        self._refresh_labels()
+
     def _edit_config(self):
         backend.load_config()  # ensure the file exists
         import subprocess
@@ -381,6 +400,7 @@ class WhisperTray(QWidget):
         model_path = backend.resolve_model_path(self.cfg["model"])
         if not model_path.exists():
             self.status.show_error(f"Model not found: {self.cfg['model']}")
+            self._open_settings()
             return
 
         self._output_file = None

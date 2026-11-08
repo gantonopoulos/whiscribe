@@ -7,6 +7,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import threading
 
 import backend
 from backend import (
@@ -66,6 +67,48 @@ def pick_device(devices: list[InputDevice]) -> InputDevice | None:
 
 
 # ---------------------------------------------------------------------------
+# Model management
+# ---------------------------------------------------------------------------
+
+def list_models(current: str) -> None:
+    rows = [(n, e) for n, e in backend.MODEL_CATALOG.items()]
+    rows.append(("vad", backend.VAD_CATALOG_ENTRY))
+    for name, entry in rows:
+        status = "present" if backend.model_present(name) else "missing"
+        mark = "*" if name == current else " "
+        print(f"{mark} {name:<26} {status:<8} {entry.size:>7}  {entry.description}")
+    print(f"\n* = configured model. Models directory: {MODELS_DIR}")
+
+
+def download_model(name: str) -> None:
+    try:
+        entry = backend.catalog_entry(name)
+    except ValueError as exc:
+        sys.exit(f"{exc}\nRun --list-models to see what is available.")
+    if backend.model_present(name):
+        print(f"Already present: {name}")
+        return
+
+    print(f"Downloading {name} ({entry.size}) …")
+
+    def progress(done: int, total: int) -> None:
+        if total:
+            pct = done * 100 // total
+            print(f"\r  {pct:3d}%  {done >> 20} / {total >> 20} MB", end="", flush=True)
+        else:
+            print(f"\r  {done >> 20} MB", end="", flush=True)
+
+    cancel = threading.Event()
+    try:
+        path = backend.download_model(name, progress, cancel)
+    except KeyboardInterrupt:
+        sys.exit("\nDownload cancelled.")
+    except OSError as exc:
+        sys.exit(f"\nDownload failed: {exc}")
+    print(f"\nSaved: {path}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -112,7 +155,23 @@ def main() -> None:
         help="Strip non-speech regions before transcription (needs the VAD model)",
     )
 
+    parser.add_argument(
+        "--list-models", action="store_true",
+        help="Show downloadable models and whether each is present, then exit",
+    )
+    parser.add_argument(
+        "--download-model", metavar="NAME",
+        help="Download a model into llm_models/ (use 'vad' for the VAD model), then exit",
+    )
+
     args = parser.parse_args()
+
+    if args.list_models:
+        list_models(cfg["model"])
+        return
+    if args.download_model:
+        download_model(args.download_model)
+        return
 
     # --- resolve the model: CLI overrides config; must exist in llm_models/ ---
     model_path = backend.resolve_model_path(args.model or cfg["model"])
@@ -122,7 +181,9 @@ def main() -> None:
         sys.exit(
             f"Model not found: {model_path}\n"
             f"Set 'model' in {CONFIG_PATH} to one of the models in {MODELS_DIR}:\n"
-            f"  {listing}"
+            f"  {listing}\n"
+            f"Or fetch one with: whiscribe --download-model {model_path.name}  "
+            f"(see --list-models)"
         )
 
     vad_model = args.vad_model if args.vad else None

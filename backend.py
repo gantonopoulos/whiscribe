@@ -28,6 +28,40 @@ MODELS_DIR = SCRIPT_DIR / "llm_models"
 # https://huggingface.co/ggml-org/whisper-vad and place in llm_models/.
 DEFAULT_VAD_MODEL = MODELS_DIR / "ggml-silero-v5.1.2.bin"
 
+_WHISPER_HF = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
+_VAD_HF = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/"
+
+
+class CatalogEntry(NamedTuple):
+    url: str
+    size: str          # human-readable, for display only
+    description: str
+
+
+# Downloadable models, in display order. Keys are filenames inside llm_models/.
+MODEL_CATALOG: dict[str, CatalogEntry] = {
+    "ggml-large-v3.bin": CatalogEntry(
+        _WHISPER_HF + "ggml-large-v3.bin", "3.1 GB",
+        "best accuracy (needs a capable GPU)"),
+    "ggml-large-v3-turbo.bin": CatalogEntry(
+        _WHISPER_HF + "ggml-large-v3-turbo.bin", "1.6 GB",
+        "near-large accuracy, much faster"),
+    "ggml-small.bin": CatalogEntry(
+        _WHISPER_HF + "ggml-small.bin", "466 MB",
+        "lightweight CPU-friendly fallback"),
+    "ggml-medium.bin": CatalogEntry(
+        _WHISPER_HF + "ggml-medium.bin", "1.5 GB", "between small and large"),
+    "ggml-base.bin": CatalogEntry(
+        _WHISPER_HF + "ggml-base.bin", "142 MB", "fast, modest accuracy"),
+    "ggml-tiny.bin": CatalogEntry(
+        _WHISPER_HF + "ggml-tiny.bin", "75 MB", "fastest, lowest accuracy"),
+}
+
+VAD_MODEL_NAME = DEFAULT_VAD_MODEL.name
+VAD_CATALOG_ENTRY = CatalogEntry(
+    _VAD_HF + VAD_MODEL_NAME, "~1 MB",
+    "Silero voice activity detection; curbs hallucinations on silence")
+
 # --- Configuration --------------------------------------------------------
 # Hand-edited TOML at ~/.config/whiscribe/config.toml. CLI flags override it.
 CONFIG_DIR = pathlib.Path(
@@ -67,6 +101,16 @@ vad = true
 # Include whisper timestamps in the output.
 timestamps = false
 """
+
+# Per-key help for GUIs (tooltips); mirrors the comments in CONFIG_TEMPLATE.
+CONFIG_HELP = {
+    "model": "Whisper model filename, looked up in the llm_models/ directory.",
+    "threads": "Threads for whisper inference.",
+    "language": 'Language hint, e.g. "en" or "el". Leave empty for auto-detect.',
+    "vad": "Strip non-speech regions before transcription (needs the Silero "
+           "VAD model). Strongly recommended — reduces hallucinated output.",
+    "timestamps": "Include whisper timestamps in the output.",
+}
 
 # VAD tuning passed to whisper-cli. whisper.cpp pads detected speech by only
 # 30 ms, which clips word onsets/endings; widen it so no words are lost. Also
@@ -496,3 +540,96 @@ def resolve_model_path(name: str) -> pathlib.Path:
     if candidate.is_absolute() or os.sep in name:
         return candidate
     return MODELS_DIR / name
+
+
+# ---------------------------------------------------------------------------
+# Model downloads and config writing
+# ---------------------------------------------------------------------------
+
+def catalog_entry(name: str) -> CatalogEntry:
+    """Catalog entry for a model filename; 'vad' aliases the VAD model."""
+    if name == "vad" or name == VAD_MODEL_NAME:
+        return VAD_CATALOG_ENTRY
+    try:
+        return MODEL_CATALOG[name]
+    except KeyError:
+        raise ValueError(f"Unknown model: {name}") from None
+
+
+def model_present(name: str) -> bool:
+    return resolve_model_path(VAD_MODEL_NAME if name == "vad" else name).exists()
+
+
+def download_model(
+    name: str,
+    progress_cb=None,
+    cancel_event: threading.Event | None = None,
+) -> pathlib.Path:
+    """Download a catalog model into llm_models/. progress_cb(done, total) is
+    called as bytes arrive (total is 0 when unknown). Streams to <name>.part and
+    renames on success; the partial file is removed on failure or cancel.
+    Raises Cancelled if cancel_event fires, OSError on network/disk errors."""
+    import urllib.request
+
+    entry = catalog_entry(name)
+    dest = resolve_model_path(VAD_MODEL_NAME if name == "vad" else name)
+    part = dest.with_name(dest.name + ".part")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        req = urllib.request.Request(entry.url, headers={"User-Agent": "whiscribe"})
+        with urllib.request.urlopen(req, timeout=30) as resp, open(part, "wb") as out:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise Cancelled()
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if progress_cb:
+                    progress_cb(done, total)
+        if total and done != total:
+            raise OSError(f"Incomplete download: got {done} of {total} bytes")
+        part.replace(dest)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    return dest
+
+
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def save_config(updates: dict) -> None:
+    """Write key = value changes into config.toml, keeping comments and order.
+    Keys not already present are appended. The result is re-parsed before it
+    replaces the file, so a bad write can't corrupt the config."""
+    if not CONFIG_PATH.exists():
+        load_config()  # creates the commented template
+    lines = CONFIG_PATH.read_text(encoding="utf-8").splitlines()
+
+    for key, value in updates.items():
+        new_line = f"{key} = {_toml_value(value)}"
+        pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        for i, line in enumerate(lines):
+            if pattern.match(line):
+                lines[i] = new_line
+                break
+        else:
+            lines.append(new_line)
+
+    text = "\n".join(lines) + "\n"
+    tomllib.loads(text)  # raises TOMLDecodeError before anything is written
+    tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(CONFIG_PATH)
+
