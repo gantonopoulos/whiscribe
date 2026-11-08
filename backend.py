@@ -85,6 +85,8 @@ DEFAULT_CONFIG = {
     "auto_delete": True,           # periodically delete old recordings
     "auto_delete_hours": 24,       # age threshold (and check is hourly)
     "warn_size_mb": 1024,          # warn when saved recordings exceed this
+    "gpu": "auto",                 # "auto" = use a GPU if present, "off" = CPU only
+    "gpu_device": 0,               # which GPU (see detect_gpus() / Settings)
 }
 
 CONFIG_TEMPLATE = """\
@@ -123,6 +125,12 @@ auto_delete_hours = 24
 
 # Warn when saved recordings use more than this many MB (1024 = 1 GB).
 warn_size_mb = 1024
+
+# Run whisper on the GPU when one is available ("auto") or force CPU ("off").
+gpu = "auto"
+
+# Which GPU to use when there are several (0 = first). Settings lists them.
+gpu_device = 0
 """
 
 # Per-key help for GUIs (tooltips); mirrors the comments in CONFIG_TEMPLATE.
@@ -140,6 +148,9 @@ CONFIG_HELP = {
                          "(checked hourly and before each recording).",
     "warn_size_mb": "Show a warning when saved recordings exceed this size in MB "
                     "(1024 = 1 GB).",
+    "gpu": '"auto" uses a GPU when one is available; "off" forces CPU-only '
+           "transcription.",
+    "gpu_device": "Which GPU to use when there are several (0 = first).",
 }
 
 # VAD tuning passed to whisper-cli. whisper.cpp pads detected speech by only
@@ -396,9 +407,12 @@ def transcribe(
     language: str | None,
     vad_model: pathlib.Path | None = None,
     cancel_event: "threading.Event | None" = None,
-) -> str | None:
-    """Run whisper-cli, stream each transcript segment to stdout, return full text
-    or None on failure. Raises Cancelled if cancel_event fires mid-run."""
+    gpu_device: int = 0,
+) -> tuple[str, bool] | None:
+    """Run whisper-cli, stream each transcript segment to stdout, and return
+    (full text, ran_on_gpu), or None on failure. ran_on_gpu comes from
+    whisper-cli's own log, because a build/driver without a usable GPU exits 0
+    and silently runs on CPU. Raises Cancelled if cancel_event fires mid-run."""
     cmd = [
         "whisper-cli",
         "-m", str(model_path),
@@ -421,6 +435,8 @@ def transcribe(
         ]
     if no_gpu:
         cmd.append("--no-gpu")
+    else:
+        cmd += ["-dev", str(gpu_device)]
     if language:
         cmd += ["-l", language]
 
@@ -431,9 +447,22 @@ def transcribe(
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
     )
+
+    # Drain stderr on a thread (an unread pipe would eventually block whisper)
+    # and note which backend it initialised for the model.
+    ran_on_gpu = False
+
+    def _read_log():
+        nonlocal ran_on_gpu
+        for log_line in proc.stderr:
+            if _GPU_BACKEND_RE.search(log_line):
+                ran_on_gpu = True
+
+    log_thread = threading.Thread(target=_read_log, daemon=True)
+    log_thread.start()
 
     # A watcher terminates whisper-cli promptly on cancel — even during the
     # (output-free) model-load phase, which a per-line check would miss.
@@ -454,6 +483,7 @@ def transcribe(
             print(line)
             lines.append(line)
     proc.wait()
+    log_thread.join(timeout=1)
     if watcher is not None:
         watcher.join(timeout=1)
 
@@ -462,7 +492,13 @@ def transcribe(
     if proc.returncode != 0:
         return None
 
-    return "\n".join(lines)
+    return "\n".join(lines), ran_on_gpu and not no_gpu
+
+
+class TranscribeResult(NamedTuple):
+    text: str
+    on_gpu: bool
+    fell_back: bool   # a GPU was expected but the transcription ran on CPU
 
 
 def transcribe_with_gpu_fallback(
@@ -472,21 +508,83 @@ def transcribe_with_gpu_fallback(
     language: str | None,
     vad_model: pathlib.Path | None = None,
     cancel_event: "threading.Event | None" = None,
-) -> str:
-    """Try GPU transcription first; fall back to CPU if it fails.
+    use_gpu: bool = True,
+    gpu_device: int = 0,
+    expect_gpu: bool = True,
+) -> TranscribeResult:
+    """Try the GPU first (unless use_gpu is False) and fall back to CPU if
+    whisper-cli fails or reports no usable GPU. expect_gpu is whether the caller
+    believes a GPU is present, so a CPU run is reported as a fallback only then.
     Raises RuntimeError if both fail, or Cancelled if aborted (no CPU retry)."""
-    print("\nTranscribing (GPU)...")
-    result = transcribe(wav_path, model_path, threads, no_gpu=False,
-                        language=language, vad_model=vad_model, cancel_event=cancel_event)
-    if result is not None:
-        return result
+    if use_gpu:
+        print("\nTranscribing (GPU)...")
+        result = transcribe(wav_path, model_path, threads, no_gpu=False,
+                            language=language, vad_model=vad_model,
+                            cancel_event=cancel_event, gpu_device=gpu_device)
+        if result is not None:
+            text, on_gpu = result
+            return TranscribeResult(text, on_gpu, expect_gpu and not on_gpu)
+        print("GPU transcription failed, retrying on CPU...")
+    else:
+        print("\nTranscribing (CPU)...")
 
-    print("GPU transcription failed, retrying on CPU...")
     result = transcribe(wav_path, model_path, threads, no_gpu=True,
-                        language=language, vad_model=vad_model, cancel_event=cancel_event)
+                        language=language, vad_model=vad_model,
+                        cancel_event=cancel_event)
     if result is None:
-        raise RuntimeError("Transcription failed on both GPU and CPU.")
-    return result
+        raise RuntimeError("Transcription failed on both GPU and CPU."
+                           if use_gpu else "Transcription failed.")
+    return TranscribeResult(result[0], False, use_gpu and expect_gpu)
+
+
+# ---------------------------------------------------------------------------
+# GPU detection
+# ---------------------------------------------------------------------------
+
+# whisper.cpp logs "whisper_backend_init_gpu: using Vulkan0 backend" when it
+# gets a GPU and "...: no GPU found" when it doesn't (note the CPU/BLAS line
+# is "whisper_backend_init:", without _gpu).
+_GPU_BACKEND_RE = re.compile(r"whisper_backend_init_gpu: using \S+ backend")
+
+
+class GpuDevice(NamedTuple):
+    index: int       # position among GPUs, as `whisper-cli -dev N` counts them
+    name: str
+
+
+def detect_gpus() -> list[GpuDevice] | None:
+    """GPUs Vulkan can see (the backend whisper.cpp uses), in `-dev` order.
+    [] means none were found; None means vulkaninfo isn't installed or failed,
+    so we can't tell."""
+    if not shutil.which("vulkaninfo"):
+        return None
+    try:
+        out = subprocess.run(
+            ["vulkaninfo", "--summary"], capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    gpus: list[GpuDevice] = []
+    for block in re.split(r"(?m)^GPU\d+:", out)[1:]:
+        dtype = re.search(r"deviceType\s*=\s*(\S+)", block)
+        name = re.search(r"deviceName\s*=\s*(.+)", block)
+        if not dtype or not name or dtype.group(1).endswith("_CPU"):
+            continue   # skip software rasterisers such as llvmpipe
+        gpus.append(GpuDevice(len(gpus), name.group(1).strip()))
+    return gpus
+
+
+def compute_summary(cfg: dict, gpus: list[GpuDevice] | None) -> str:
+    """One-line description of where transcription will run."""
+    if cfg["gpu"] == "off":
+        return "CPU (GPU disabled)"
+    if gpus is None:
+        return "GPU if available (install vulkan-tools to detect)"
+    if not gpus:
+        return "CPU (no GPU found)"
+    dev = next((g for g in gpus if g.index == cfg["gpu_device"]), gpus[0])
+    return f"GPU — {dev.name}"
 
 
 def strip_timestamps(text: str) -> str:

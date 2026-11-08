@@ -30,7 +30,8 @@ The program is essentially glue around these; behavior depends heavily on their 
 
 - `pactl` (libpulse) — device/card enumeration and Bluetooth profile switching. Code parses its human-readable `list sources` / `list cards` text output with regex, so it is sensitive to PulseAudio/PipeWire output format.
 - `arecord` (alsa-utils) — records WAV via the `pulse` device, targeted using the `PULSE_SOURCE` env var.
-- `whisper-cli` (whisper.cpp) — transcription. GPU (Vulkan) is attempted first; `--no-gpu` retry on non-zero exit.
+- `whisper-cli` (whisper.cpp) — transcription. GPU (Vulkan) is attempted first (`-dev N`); `--no-gpu` retry on non-zero exit. **Gotcha:** a build/driver with no usable GPU (or a bad `-dev`) exits 0 and runs on CPU, so `transcribe()` parses stderr for `whisper_backend_init_gpu: using … backend` to know what really ran; stderr must be drained on a thread. `gpu = "off"` skips the GPU entirely.
+- `vulkaninfo` (vulkan-tools) — `detect_gpus()` lists Vulkan GPUs (skipping llvmpipe) for the tray's **Compute:** label and the Settings device picker; `None` result = tool missing.
 - `wl-copy` (wl-clipboard) — Wayland clipboard + primary selection.
 - `stdbuf` (coreutils, optional) — wrapped around whisper-cli to force line-buffered output so segments stream live.
 

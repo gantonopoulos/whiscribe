@@ -7,7 +7,7 @@ import threading
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
     QRadioButton, QSpinBox, QVBoxLayout,
 )
@@ -55,6 +55,7 @@ class SettingsDialog(QDialog):
         root = QVBoxLayout(self)
         root.addWidget(self._build_models())
         root.addWidget(self._build_options())
+        root.addWidget(self._build_compute())
         root.addWidget(self._build_recordings())
 
         # Shared progress row for whichever download is running.
@@ -138,6 +139,52 @@ class SettingsDialog(QDialog):
         self.timestamps.setToolTip(backend.CONFIG_HELP["timestamps"])
         form.addRow(self.timestamps)
         return box
+
+    def _build_compute(self) -> QGroupBox:
+        box = QGroupBox("Compute")
+        form = QFormLayout(box)
+
+        self.gpu_mode = QComboBox()
+        self.gpu_mode.addItem("Auto (use GPU if available)", "auto")
+        self.gpu_mode.addItem("CPU only", "off")
+        self.gpu_mode.setCurrentIndex(0 if self.cfg["gpu"] != "off" else 1)
+        self.gpu_mode.setToolTip(backend.CONFIG_HELP["gpu"])
+        form.addRow("Mode", self.gpu_mode)
+
+        self.gpu_device = QComboBox()
+        self.gpu_device.setToolTip(backend.CONFIG_HELP["gpu_device"])
+        self.gpu_status = self._hint("")
+        redetect = QPushButton("Re-detect")
+        redetect.clicked.connect(self._detect_gpus)
+        row = QHBoxLayout()
+        row.addWidget(self.gpu_device, 1)
+        row.addWidget(redetect)
+        form.addRow("GPU", row)
+        form.addRow(self.gpu_status)
+
+        self.gpu_mode.currentIndexChanged.connect(self._update_gpu_enabled)
+        self._detect_gpus()
+        return box
+
+    def _detect_gpus(self) -> None:
+        gpus = backend.detect_gpus()
+        self.gpu_device.clear()
+        for g in gpus or []:
+            self.gpu_device.addItem(g.name, g.index)
+        i = self.gpu_device.findData(int(self.cfg["gpu_device"]))
+        self.gpu_device.setCurrentIndex(max(i, 0))
+        if gpus is None:
+            self.gpu_status.setText("vulkaninfo not found — install vulkan-tools "
+                                    "to detect GPUs. Auto will still try the GPU.")
+        elif not gpus:
+            self.gpu_status.setText("No GPU found; transcription will use the CPU.")
+        else:
+            self.gpu_status.setText(f"{len(gpus)} GPU(s) detected.")
+        self._update_gpu_enabled()
+
+    def _update_gpu_enabled(self) -> None:
+        self.gpu_device.setEnabled(
+            self.gpu_mode.currentData() == "auto" and self.gpu_device.count() > 1)
 
     def _build_recordings(self) -> QGroupBox:
         box = QGroupBox("Saved recordings")
@@ -296,6 +343,9 @@ class SettingsDialog(QDialog):
                 "language": self.language.text().strip(),
                 "vad": self.vad.isChecked(),
                 "timestamps": self.timestamps.isChecked(),
+                "gpu": self.gpu_mode.currentData(),
+                "gpu_device": (self.gpu_device.currentData()
+                               if self.gpu_device.count() else self.cfg["gpu_device"]),
                 "delete_on_start": self.delete_on_start.isChecked(),
                 "auto_delete": self.auto_delete.isChecked(),
                 "auto_delete_hours": self.auto_hours.value(),

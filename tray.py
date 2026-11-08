@@ -113,16 +113,18 @@ class TranscribeWorker(QThread):
     """Transcribes a WAV (GPU then CPU), post-processes, and emits the text.
     The WAV is left in place (it is a saved recording)."""
 
-    done = Signal(str)      # transcript
+    done = Signal(str, bool)   # transcript, GPU was expected but CPU ran
     failed = Signal(str)
 
     def __init__(self, wav_path: str, cfg: dict,
-                 model_path: pathlib.Path, vad_model: pathlib.Path | None):
+                 model_path: pathlib.Path, vad_model: pathlib.Path | None,
+                 expect_gpu: bool = True):
         super().__init__()
         self.wav_path = wav_path
         self.cfg = cfg
         self.model_path = model_path
         self.vad_model = vad_model
+        self.expect_gpu = expect_gpu
         self._cancel = threading.Event()
 
     def request_cancel(self) -> None:
@@ -131,10 +133,13 @@ class TranscribeWorker(QThread):
     def run(self) -> None:
         wav = pathlib.Path(self.wav_path)
         try:
-            raw = backend.transcribe_with_gpu_fallback(
+            result = backend.transcribe_with_gpu_fallback(
                 wav, self.model_path, self.cfg["threads"],
                 self.cfg["language"] or None, vad_model=self.vad_model,
                 cancel_event=self._cancel,
+                use_gpu=self.cfg["gpu"] != "off",
+                gpu_device=self.cfg["gpu_device"],
+                expect_gpu=self.expect_gpu,
             )
         except backend.Cancelled:
             return  # aborted by the user; the tray resets its own UI
@@ -142,12 +147,13 @@ class TranscribeWorker(QThread):
             self.failed.emit(str(exc))
             return
 
+        raw = result.text
         text = raw if self.cfg["timestamps"] else backend.strip_timestamps(raw)
         text = backend.collapse_repeats(text)
         if not text.strip():
             self.failed.emit("No speech detected.")
             return
-        self.done.emit(text)
+        self.done.emit(text, result.fell_back)
 
 
 # ---------------------------------------------------------------------------
@@ -162,15 +168,17 @@ class TrayFeedback:
     def __init__(self, tray: QSystemTrayIcon):
         self.tray = tray
         self._elapsed = 0
+        self._note = ""
         self._timer = QTimer()
         self._timer.timeout.connect(self._tick)
 
     def _notify(self, message: str, msecs: int = 3000):
         self.tray.showMessage("whiscribe", message, self.tray.icon(), msecs)
 
-    def show_recording(self):
+    def show_recording(self, note: str = ""):
         self._elapsed = 0
-        self.tray.setToolTip("whiscribe — Recording 0:00")
+        self._note = f" ({note})" if note else ""
+        self.tray.setToolTip(f"whiscribe — Recording 0:00{self._note}")
         self._timer.start(1000)
         self._notify("Recording…")
 
@@ -194,7 +202,8 @@ class TrayFeedback:
     def _tick(self):
         self._elapsed += 1
         self.tray.setToolTip(
-            f"whiscribe — Recording {self._elapsed // 60}:{self._elapsed % 60:02d}")
+            f"whiscribe — Recording {self._elapsed // 60}:{self._elapsed % 60:02d}"
+            f"{self._note}")
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +228,7 @@ class WhisperTray(QWidget):
         self._devices: list[backend.InputDevice] = []
         self._selected_device: backend.InputDevice | None = None
         self._settings = None
+        self.gpus = backend.detect_gpus()   # None = vulkaninfo missing
 
         self._startup_purge()
         self._purge_timer = QTimer(self)
@@ -285,6 +295,10 @@ class WhisperTray(QWidget):
         self.act_model.setEnabled(False)
         self.menu.addAction(self.act_model)
 
+        self.act_compute = QAction("", self)
+        self.act_compute.setEnabled(False)
+        self.menu.addAction(self.act_compute)
+
         self.history_menu = QMenu("Previous transcriptions", self.menu)
         self.history_menu.aboutToShow.connect(self._populate_history)
         self.menu.addMenu(self.history_menu)
@@ -311,6 +325,8 @@ class WhisperTray(QWidget):
     def _refresh_labels(self):
         self.cfg = backend.load_config()
         self.act_model.setText(f"Model: {self.cfg['model']}")
+        self.act_compute.setText(
+            f"Compute: {backend.compute_summary(self.cfg, self.gpus)}")
 
     def _populate_devices(self):
         try:
@@ -445,6 +461,7 @@ class WhisperTray(QWidget):
 
     def _on_settings_closed(self, _result: int):
         self._settings = None
+        self.gpus = backend.detect_gpus()   # the user may have installed a driver
         self._refresh_labels()
 
     def _edit_config(self):
@@ -511,7 +528,9 @@ class WhisperTray(QWidget):
 
         self._recording = True
         self._set_busy_ui("recording")
-        self.status.show_recording()
+        # Silent when all is well or the user chose CPU; only flag the surprise.
+        no_gpu = self.cfg["gpu"] != "off" and self.gpus == []
+        self.status.show_recording("CPU mode — no GPU found" if no_gpu else "")
 
         self._record_worker = RecordWorker(self._selected_device)
         self._record_worker.done.connect(self._on_recorded)
@@ -540,24 +559,27 @@ class WhisperTray(QWidget):
         model_path = backend.resolve_model_path(self.cfg["model"])
         vad_model = backend.DEFAULT_VAD_MODEL if self.cfg["vad"] else None
 
-        self._transcribe_worker = TranscribeWorker(wav_path, self.cfg, model_path, vad_model)
+        self._transcribe_worker = TranscribeWorker(
+            wav_path, self.cfg, model_path, vad_model,
+            expect_gpu=self.gpus != [])
         self._transcribe_worker.done.connect(self._on_transcribed)
         self._transcribe_worker.failed.connect(self._on_error)
         self._transcribe_worker.start()
 
-    def _on_transcribed(self, text: str):
+    def _on_transcribed(self, text: str, fell_back: bool = False):
         self._reset_idle()
+        note = " (GPU failed — used CPU)" if fell_back else ""
         if self._output_file:
             try:
                 p = pathlib.Path(self._output_file)
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(text + "\n", encoding="utf-8")
-                self.status.show_done(f"Saved: {p.name}")
+                self.status.show_done(f"Saved: {p.name}{note}")
             except OSError as exc:
                 self.status.show_error(f"Save failed: {exc}")
         else:
             if backend.set_clipboard(text):
-                self.status.show_done("Copied to clipboard")
+                self.status.show_done(f"Copied to clipboard{note}")
             else:
                 self.status.show_error("Clipboard unavailable")
 

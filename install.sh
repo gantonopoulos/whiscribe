@@ -13,6 +13,10 @@ chmod +x "$REPO/whiscribe.py" "$REPO/tray.py"
 ln -sf "$REPO/whiscribe.py" ~/.local/bin/whiscribe
 ln -sf "$REPO/tray.py"      ~/.local/bin/whiscribe-tray
 
+# --- optional dependency check ---------------------------------------------
+command -v vulkaninfo >/dev/null 2>&1 || \
+    echo "Note: vulkaninfo not found — install vulkan-tools so whiscribe can detect your GPU."
+
 # --- application icon ------------------------------------------------------
 ICONDIR=~/.local/share/icons/hicolor/scalable/apps
 mkdir -p "$ICONDIR"

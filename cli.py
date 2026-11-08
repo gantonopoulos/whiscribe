@@ -162,6 +162,15 @@ def main() -> None:
         help="Download a model into llm_models/ (use 'vad' for the VAD model), then exit",
     )
 
+    parser.add_argument(
+        "--cpu", action="store_true",
+        help="Force CPU-only transcription for this run (config: gpu = \"off\")",
+    )
+    parser.add_argument(
+        "--gpu-device", type=int, default=cfg["gpu_device"], metavar="N",
+        help="Which GPU to use when there are several (0 = first)",
+    )
+
     args = parser.parse_args()
 
     if args.list_models:
@@ -235,12 +244,20 @@ def main() -> None:
         sys.exit("No usable recording — WAV file is missing or too small.")
     print(f"Recording kept: {wav_path}")
 
-    # --- transcribe (GPU first, CPU fallback) ---
+    # --- transcribe (GPU first unless disabled, CPU fallback) ---
+    use_gpu = cfg["gpu"] != "off" and not args.cpu
+    gpus = backend.detect_gpus() if use_gpu else []
+    print(f"Compute: {backend.compute_summary({**cfg, 'gpu': 'auto' if use_gpu else 'off', 'gpu_device': args.gpu_device}, gpus)}")
     try:
-        raw_text = backend.transcribe_with_gpu_fallback(
-            wav_path, model_path, args.threads, args.language, vad_model=vad_model)
+        result = backend.transcribe_with_gpu_fallback(
+            wav_path, model_path, args.threads, args.language, vad_model=vad_model,
+            use_gpu=use_gpu, gpu_device=args.gpu_device,
+            expect_gpu=use_gpu and gpus != [])
     except RuntimeError as exc:
         sys.exit(str(exc))
+    raw_text = result.text
+    if result.fell_back:
+        print("Note: GPU failed — transcribed on CPU instead.")
     print()
 
     if not raw_text:

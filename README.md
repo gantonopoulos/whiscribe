@@ -14,6 +14,7 @@ Targets KDE Plasma / Wayland on Manjaro Linux, but should work on any PipeWire/P
 | `arecord` | `alsa-utils` | audio recording |
 | `pactl` | `libpulse` | device enumeration + BT profile switching |
 | `wl-copy` | `wl-clipboard` | Wayland clipboard (optional; falls back to KDE Klipper via `qdbus`) |
+| `vulkaninfo` | `vulkan-tools` | GPU detection for the tray label and Settings |
 | `stdbuf` | `coreutils` | live transcription output (optional) |
 
 ### Python
@@ -106,6 +107,8 @@ delete_on_start = true        # saved recordings: see "Saved recordings" below
 auto_delete = true
 auto_delete_hours = 24
 warn_size_mb = 1024
+gpu = "auto"                  # or "off" to force CPU
+gpu_device = 0
 ```
 
 If the configured model isn't in `llm_models/`, whiscribe exits with an error listing
@@ -126,7 +129,14 @@ the models it did find. Command-line flags below override the config per run.
 | `--list-models` | — | show downloadable models and whether each is present, then exit |
 | `--download-model NAME` | — | download a model into `llm_models/` (`vad` for the VAD model), then exit |
 
-GPU inference via Vulkan is tried automatically first; falls back to CPU if unavailable.
+GPU inference via Vulkan is tried automatically first; falls back to CPU if it
+fails. whiscribe also reads whisper's startup log, because a build or driver without
+a usable GPU exits successfully and silently runs on the CPU — that case is reported
+as a fallback too. The CLI prints the compute target before transcribing; `--cpu`
+forces CPU for one run and `--gpu-device N` picks a GPU. Config keys `gpu`
+(`"auto"` / `"off"`) and `gpu_device` set the defaults; the tray shows a
+**Compute:** line in its menu, lets you change both in **Settings…**, and mentions
+"GPU failed — used CPU" in the result notification if a fallback happened.
 
 Clipboard uses `wl-copy` when available, falling back to KDE Klipper over D-Bus.
 
